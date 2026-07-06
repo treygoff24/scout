@@ -19,6 +19,7 @@ Current phase: shipped. 0.1.0 published to crates.io (`scout-cli`) and the `trey
 - Cursor safe review of M3 fix (`cursor-3`): folded two real findings. Exact-claim matching now uses quote text only (not model-written `fact`) and records filtered hits as `partial_claim_match` drops.
 - M3 targeted negative after review fold: PASS; candidate-file recall 100.0%, coverage 100.0%, poison survivors 0, negatives_clean true, avg $0.1138/query, artifact `.scout/eval-runs/m3-1783308182960/pact-negative-blank-check.json`.
 - M3 final full markdown gate after review fold: PASS; candidate-file recall 100.0%, coverage 82.61%, poison survivors 0, negatives_clean true, avg $0.1265/query, spend $0.6327, artifact dir `.scout/eval-runs/m3-1783308183980`.
+- M3 post-hardening re-verification (2026-07-06, after the three review waves): PASS with IMPROVED coverage; candidate-file recall 100.0%, coverage 91.30%, poison survivors 0, negatives_clean true, avg $0.1349/query, artifact dir `.scout/eval-runs/m3-1783350425981`. The markdown-normalized quote tier recovered previously false-dropped quotes — source of the 82.61 → 91.30 improvement cited in the summary above.
 - M4 adapter seam: VERIFIED locally by `cargo run -- doctor --pretty`; `ctags`, `pdftotext`, and `pandoc` all reported present, with `degraded.code_symbols=false`, `degraded.pdf=false`, `degraded.docx=false`. PDF/docx adapters are behind the same `adapter_for`/`read_adapter_text` seam and gracefully report unsupported/tool-missing files in index skips.
 
 ## Spend
