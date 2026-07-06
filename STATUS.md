@@ -1,6 +1,8 @@
 # scout build status
 
-Current phase: post-review hardening campaign complete (2026-07-06). M1 re-verified green post-refactor (recall 100, coverage 80.95, poison 0, $0.5839). M3 re-verified green with IMPROVED coverage 91.30 (was 82.61; markdown-normalized quote tier recovered false drops), negatives clean, $0.6747. Three reviewed waves: trust/state-machine (f3ba5aa), robustness (b2ba48f), agent-UX (d155630). 46 unit tests. See docs/dogfood/2026-07-06-journal.md for the driving findings and scorecard.
+Internal build/eval status record kept during development. Left as-is post-ship for provenance — read the entries below as a chronological log of what was measured during the build, not a live dashboard.
+
+Current phase: shipped. 0.1.0 published to crates.io (`scout-cli`) and the `treygoff24/homebrew-tap` Homebrew tap (`brew install treygoff24/tap/scout`), with tag `v0.1.0` pushed and released on GitHub. Post-review hardening campaign completed before ship (2026-07-06). M1 re-verified green post-refactor (recall 100, coverage 80.95, poison 0, $0.5839). M3 re-verified green with IMPROVED coverage 91.30 (was 82.61; markdown-normalized quote tier recovered false drops), negatives clean, $0.6747. Three reviewed waves: trust/state-machine (f3ba5aa), robustness (b2ba48f), agent-UX (d155630). 46 unit tests. See docs/dogfood/2026-07-06-journal.md for the driving findings and scorecard.
 
 ## Gates / numbers
 
@@ -38,7 +40,6 @@ Current phase: post-review hardening campaign complete (2026-07-06). M1 re-verif
 
 - M2 live paired-session A/B gate remains DEFERRED-TO-HUMAN by design; scout's deliverables and predeclaration are complete, but the live Claude-session comparison cannot be honestly run inside this agent session.
 - M4 PDF/docx adapters are implemented and doctor-verified, but no full-PDF/docx policy corpus eval was predeclared or run in this build.
-- No push and no crates.io publish performed.
 
 ## Human verification commands
 

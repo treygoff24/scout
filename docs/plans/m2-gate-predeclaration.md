@@ -1,6 +1,6 @@
 # M2 gate predeclaration — scout hydration token A/B
 
-Status: DEFERRED-TO-HUMAN. This gate requires paired fresh Claude sessions and cannot be honestly run by this non-interactive build agent.
+Written 2026-07-06, before any M2 gate attempt, as part of the scout build. Status: DEFERRED-TO-HUMAN and still open as of the 0.1.0 release — this gate requires paired fresh Claude sessions and cannot be honestly run by an unattended build agent. Anyone can run the protocol below themselves; nothing here has been executed yet.
 
 ## Fixed parameters before run one
 
