@@ -1,0 +1,6 @@
+/.scout/
+/target
+.env
+__pycache__/
+/eval/goldens/private/
+/.delegate/

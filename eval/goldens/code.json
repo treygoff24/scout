@@ -1,0 +1,226 @@
+{
+  "queries": [
+    {
+      "id": "w-redact",
+      "corpus_root": "/Users/treygoff/Code/volley/watcher",
+      "query": "What does the watcher redact from transcript text before it leaves the machine, and what does it deliberately leave alone?",
+      "must_find": [
+        {
+          "id": "F1",
+          "fact": "Home paths (/Users/<name>/ or /home/<name>/) are rewritten to ~/ before text reaches a third party",
+          "file": "redact.py",
+          "line": 31
+        },
+        {
+          "id": "F2",
+          "fact": "Known token formats (sk-ant-, sk-, csk-, AKIA, ghp_, github_pat_, glpat-, npm_, pypi-, xox*) are redacted wholesale",
+          "file": "redact.py",
+          "line": 9
+        },
+        {
+          "id": "F3",
+          "fact": "High-entropy-charset strings >=32 chars are redacted, EXCEPT values with 2+ slashes which are treated as file paths and left alone",
+          "file": "redact.py",
+          "line": 118
+        },
+        {
+          "id": "F4",
+          "fact": "UUIDs and 40-char hex strings (git SHA shaped) are deliberately skipped, not redacted",
+          "file": "redact.py",
+          "line": 113
+        },
+        {
+          "id": "F5",
+          "fact": "Email addresses are redacted with numbered [REDACTED_EMAIL_n] placeholders",
+          "file": "redact.py",
+          "line": 7
+        },
+        {
+          "id": "F6",
+          "fact": "Secret placeholders preserve the original value's length ([REDACTED_SECRET_n len=N])",
+          "file": "redact.py",
+          "line": 39
+        }
+      ],
+      "poison": [
+        {
+          "id": "P1",
+          "fact": "Redacted values are replaced with a SHA-256 hash of the secret"
+        },
+        {
+          "id": "P2",
+          "fact": "The redactor keeps a persistent on-disk denylist of previously seen secrets"
+        },
+        {
+          "id": "P3",
+          "fact": "IP addresses are detected and redacted"
+        }
+      ],
+      "negative": false
+    },
+    {
+      "id": "w-tail",
+      "corpus_root": "/Users/treygoff/Code/volley/watcher",
+      "query": "How does the live tail pick which transcripts to watch, and when does it stop watching one?",
+      "must_find": [
+        {
+          "id": "F1",
+          "fact": "Only .jsonl transcripts modified within the last 600 seconds (ACTIVE_S) count as active",
+          "file": "tail.py",
+          "line": 37
+        },
+        {
+          "id": "F2",
+          "fact": "The tail excludes its own session(s), read from CLAUDE_SESSION_ID",
+          "file": "tail.py",
+          "line": 41
+        },
+        {
+          "id": "F3",
+          "fact": "Directories containing memoryd-dream-scratch or delegate-safe are skipped as other systems' internals",
+          "file": "tail.py",
+          "line": 38
+        },
+        {
+          "id": "F4",
+          "fact": "On first sight of a transcript the tail attaches at current EOF; history is the EOD replay's job",
+          "file": "tail.py",
+          "line": 385
+        },
+        {
+          "id": "F5",
+          "fact": "Idle/stale per-file state is dropped; the file re-attaches at EOF if it wakes up",
+          "file": "tail.py",
+          "line": 403
+        },
+        {
+          "id": "F6",
+          "fact": "The tail polls on a 5-second interval",
+          "file": "tail.py",
+          "line": 34
+        }
+      ],
+      "poison": [
+        {
+          "id": "P1",
+          "fact": "The tail uses filesystem event notifications (inotify/FSEvents) to detect new writes"
+        },
+        {
+          "id": "P2",
+          "fact": "The tail watches only the single most recently modified transcript"
+        },
+        {
+          "id": "P3",
+          "fact": "When the budget reserve is hit the tail terminates the watched session"
+        }
+      ],
+      "negative": false
+    },
+    {
+      "id": "w-neg",
+      "corpus_root": "/Users/treygoff/Code/volley/watcher",
+      "query": "Where is the websocket reconnection and streaming retry logic for the Cerebras API connection?",
+      "must_find": [],
+      "poison": [],
+      "negative": true
+    },
+    {
+      "id": "r-budget",
+      "corpus_root": "/Users/treygoff/Code/recon/src",
+      "query": "How does receipts enforce its dollar and time budget caps during a run?",
+      "must_find": [
+        {
+          "id": "F1",
+          "fact": "Pre-launch projection gate: a unit may launch only if current spend plus projected unit cost fits under the dollar cap",
+          "file": "budget.rs",
+          "line": 39
+        },
+        {
+          "id": "F2",
+          "fact": "The first cap hit records a sticky reason ('dollars' or 'seconds') via OnceLock and all later launches are refused",
+          "file": "budget.rs",
+          "line": 40
+        },
+        {
+          "id": "F3",
+          "fact": "may_launch calls must be serialized by the caller (StageContext budget_gate mutex); overshoot is bounded at one in-flight unit per concurrent worker",
+          "file": "budget.rs",
+          "line": 28
+        },
+        {
+          "id": "F4",
+          "fact": "The adaptive verify escalation (+2 judges) is itself budget-gated; if the budget refuses, the single judge's verdict stands",
+          "file": "pipeline/verify.rs",
+          "line": 370
+        }
+      ],
+      "poison": [
+        {
+          "id": "P1",
+          "fact": "Budget enforcement cancels in-flight requests when the cap is crossed"
+        },
+        {
+          "id": "P2",
+          "fact": "Budget state is persisted to disk and carried across runs"
+        }
+      ],
+      "negative": false
+    },
+    {
+      "id": "r-verify",
+      "corpus_root": "/Users/treygoff/Code/recon/src",
+      "query": "How does receipts decide the final verdict for a claim, and what guarantees apply to the quote attached to it?",
+      "must_find": [
+        {
+          "id": "F1",
+          "fact": "Final verdict is a majority vote over judge votes; a tie resolves to Partial",
+          "file": "pipeline/verify.rs",
+          "line": 412
+        },
+        {
+          "id": "F2",
+          "fact": "Adaptive policy escalates to two more judges only when the first verdict is Partial; Paranoid always uses three judges",
+          "file": "pipeline/verify.rs",
+          "line": 365
+        },
+        {
+          "id": "F3",
+          "fact": "Only supported/partial verdicts may carry a quote",
+          "file": "pipeline/verify.rs",
+          "line": 441
+        },
+        {
+          "id": "F4",
+          "fact": "A quote must be an exact whitespace/case-normalized substring of the fetched source text or it is dropped with a visible note",
+          "file": "pipeline/verify.rs",
+          "line": 442
+        },
+        {
+          "id": "F5",
+          "fact": "The judge prompt demands SUPPORTED only if the text states the claim, with the quote copied verbatim",
+          "file": "pipeline/verify.rs",
+          "line": 394
+        }
+      ],
+      "poison": [
+        {
+          "id": "P1",
+          "fact": "Quote validation uses fuzzy similarity scoring (e.g. Levenshtein distance) against the source"
+        },
+        {
+          "id": "P2",
+          "fact": "Receipts re-fetches the source URL a second time to confirm quotes before final output"
+        }
+      ],
+      "negative": false
+    },
+    {
+      "id": "r-neg",
+      "corpus_root": "/Users/treygoff/Code/recon/src",
+      "query": "Where does receipts cache search results in a local SQLite database between runs?",
+      "must_find": [],
+      "poison": [],
+      "negative": true
+    }
+  ]
+}
