@@ -88,7 +88,7 @@ I was asked to use scout for codebase exploration during a real implementation g
 
 ## Artifacts
 
-- Stack sample: `/tmp/scout-sample.txt` on the reporting host (2610/2656 samples in `sleep_retry`).
+- Stack sample: `docs/dogfood/2026-07-08-index-retry-storm-sample.txt` (2610/2656 samples in `sleep_retry`).
 - Repro envelope: inline above (2-file run, `timings_ms.total: 35741`).
 - Requesting-session journal (full context): `prospera-radar-build/state/journal-2026-07-08-chat-monitor-goal.md`.
 - The stuck index (PID 35397) was left running at report time for further live inspection; it is budget-capped at $5 and spending nothing while quota-blocked.
