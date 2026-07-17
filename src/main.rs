@@ -4952,6 +4952,222 @@ mod tests {
         assert!(!garbage.exists());
     }
 
+    #[test]
+    fn serialized_card_provider_payload_contains_redactions_not_source_secrets() {
+        let file = WalkedFile {
+            rel: "notes.md".into(),
+            text: "contact trey@example.com with token sk-1234567890abcdef".into(),
+            adapter: "markdown".into(),
+            hash: "h".into(),
+        };
+        let text = truncate_chars(&redact_outbound(&file.text).0, 16_000);
+        let prompt = format!("FILE: {}\nADAPTER: {}\n\n{}", file.rel, file.adapter, text);
+        let captured = serde_json::to_string(&json!({
+            "messages": [Message::system("system"), Message::user(prompt)]
+        }))
+        .unwrap();
+        assert!(!captured.contains("trey@example.com"));
+        assert!(!captured.contains("sk-1234567890abcdef"));
+        assert!(captured.contains("[REDACTED_EMAIL_"));
+        assert!(captured.contains("[REDACTED_SECRET_"));
+    }
+
+    #[test]
+    fn retryable_status_taxonomy_is_limited_to_throttling_and_server_errors() {
+        for status in [429, 500, 502, 599] {
+            assert!(retryable(status), "{status}");
+        }
+        for status in [200, 400, 401, 403, 404, 422, 600] {
+            assert!(!retryable(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn partial_generation_persists_cards_completed_before_provider_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cards = Vec::new();
+        let mut skipped = Vec::new();
+        record_card_result(
+            &mut cards,
+            &mut skipped,
+            "done.md".into(),
+            Some("markdown".into()),
+            Ok(test_card("done.md")),
+        );
+        record_card_result(
+            &mut cards,
+            &mut skipped,
+            "failed.md".into(),
+            Some("markdown".into()),
+            Err(provider_error("quota exhausted")),
+        );
+        assert_eq!(
+            index_state_after_card_generation(&cards, &skipped, &[]),
+            "partial"
+        );
+        let manifest = test_manifest(dir.path(), cards.len());
+        write_generation(dir.path(), &manifest, &cards).unwrap();
+        let persisted = load_cards(&open_snapshot(dir.path()).unwrap()).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].path, "done.md");
+    }
+
+    #[test]
+    fn one_rebuild_keeps_concurrent_snapshot_reads_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_generation(
+            dir.path(),
+            &test_manifest(dir.path(), 1),
+            &[test_card_with_role("a.md", "old")],
+        )
+        .unwrap();
+        let root = Arc::new(dir.path().to_path_buf());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_root = root.clone();
+        let writer_barrier = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            write_generation(
+                &writer_root,
+                &test_manifest(&writer_root, 1),
+                &[test_card_with_role("a.md", "new")],
+            )
+            .unwrap();
+            prune_generations(&writer_root, 2).unwrap();
+        });
+        barrier.wait();
+        for _ in 0..100 {
+            let cards = load_cards(&open_snapshot(&root).unwrap()).unwrap();
+            assert_eq!(cards.len(), 1);
+            assert!(matches!(cards[0].role.value.as_str(), "old" | "new"));
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn additions_deletions_and_manifest_inputs_invalidate_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus = dir.path().join("corpus");
+        fs::create_dir(&corpus).unwrap();
+        fs::write(corpus.join("a.md"), "# A\n").unwrap();
+        let (files, _) = walk_corpus(&corpus, false, false).unwrap();
+        let cards = files.iter().map(|f| skeletonize(f, 0)).collect::<Vec<_>>();
+        let mut manifest = test_manifest_with_files(&corpus, cards.len(), &files);
+        manifest.model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
+
+        fs::write(corpus.join("b.md"), "# B\n").unwrap();
+        assert_eq!(
+            changed_files_since_cards(&corpus, &manifest, &cards).unwrap(),
+            1
+        );
+        fs::rename(corpus.join("a.md"), dir.path().join("a.removed")).unwrap();
+        assert_eq!(
+            changed_files_since_cards(&corpus, &manifest, &cards).unwrap(),
+            2
+        );
+
+        assert!(manifest_current(&manifest, &corpus));
+        let mut changed_manifest = manifest.clone();
+        changed_manifest.schema_version += 1;
+        assert!(!manifest_current(&changed_manifest, &corpus));
+        changed_manifest = manifest.clone();
+        changed_manifest.model.push_str("-different");
+        assert!(!manifest_current(&changed_manifest, &corpus));
+        fs::write(corpus.join(".scoutignore"), "ignored\n").unwrap();
+        assert!(!manifest_current(&manifest, &corpus));
+    }
+
+    #[test]
+    fn artifact_setup_failure_is_reported_without_mutating_the_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".scout"), "not a directory").unwrap();
+        let mut env = Envelope::new("query", "ok");
+        env.data = json!({"findings": [{"fact": "paid result"}]});
+        let before = serde_json::to_value(&env).unwrap();
+        assert!(persist_query_artifacts(dir.path(), &mut env).is_err());
+        assert_eq!(serde_json::to_value(&env).unwrap(), before);
+    }
+
+    #[test]
+    fn quote_omission_preserves_finding_order() {
+        let findings = (0..3)
+            .map(|i| Finding {
+                file: format!("{i}.md"),
+                line: i + 1,
+                fact: format!("fact {i}"),
+                quote: Some("long quote ".repeat(100)),
+                quote_omitted: false,
+                router_rank: Some(i + 1),
+                deterministic_score: 0.0,
+                match_tier: Some("exact".into()),
+            })
+            .collect::<Vec<_>>();
+        let packed = pack_findings(findings, Some(1));
+        assert_eq!(
+            packed.iter().map(|f| f.file.as_str()).collect::<Vec<_>>(),
+            vec!["0.md", "1.md", "2.md"]
+        );
+        assert!(packed.iter().all(|f| f.quote_omitted));
+    }
+
+    #[test]
+    fn pdf_and_docx_adapters_cover_success_missing_and_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let corpus = tempfile::tempdir().unwrap();
+        for (name, output) in [
+            ("pdftotext", "# PDF\nalpha\n"),
+            ("pandoc", "# DOCX\nbeta\n"),
+        ] {
+            let path = tools.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{}'\n", output)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(corpus.path().join("a.pdf"), "fake pdf").unwrap();
+        fs::write(corpus.path().join("b.docx"), "fake docx").unwrap();
+        fs::write(corpus.path().join("c.md"), "# Markdown\ngamma\n").unwrap();
+        let _path = ScopedPath::set(tools.path());
+
+        let (files, skipped) = walk_corpus(corpus.path(), false, false).unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(files.len(), 3);
+        let pdf = files.iter().find(|f| f.rel == "a.pdf").unwrap();
+        let docx = files.iter().find(|f| f.rel == "b.docx").unwrap();
+        assert_eq!(pdf.text, "# PDF\nalpha\n");
+        assert_eq!(docx.text, "# DOCX\nbeta\n");
+        assert_eq!(outline(&pdf.text)[0].line, 1);
+        assert!(
+            chunks_for(&pdf.rel, &pdf.text, "ranked_boundary")[0]
+                .1
+                .contains("1| # PDF")
+        );
+
+        let failing = tools.path().join("pdftotext");
+        fs::write(&failing, "#!/bin/sh\nexit 7\n").unwrap();
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(read_adapter_text(&corpus.path().join("a.pdf"), "pdf").is_err());
+
+        let empty_path = tempfile::tempdir().unwrap();
+        let _missing_path = ScopedPath::set(empty_path.path());
+        assert!(read_adapter_text(&corpus.path().join("a.pdf"), "pdf").is_err());
+        assert!(read_adapter_text(&corpus.path().join("b.docx"), "docx").is_err());
+    }
+
+    #[test]
+    fn quote_firewall_handles_five_line_boundary_and_multiline_quotes() {
+        let text = "one\ntwo\nthree\nfour\nfive\nalpha beta\nseven\n";
+        let files = HashMap::from([("a.md".to_string(), text.to_string())]);
+        let at_boundary = finding_at("a.md", 1, "alpha beta");
+        let outside_boundary = finding_at("a.md", 12, "alpha beta");
+        let multiline = finding_at("a.md", 6, "alpha\nbeta");
+        let (kept, dropped) = verify_quotes(vec![at_boundary, outside_boundary, multiline], &files);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].reason, "line_mismatch:6");
+    }
+
     fn cand(path: &str, router_rank: Option<usize>, deterministic_score: f64) -> Candidate {
         Candidate {
             path: path.into(),
@@ -4968,6 +5184,41 @@ mod tests {
             fact: None,
             quote: None,
             reason: reason.into(),
+        }
+    }
+
+    fn finding_at(path: &str, line: usize, quote: &str) -> Finding {
+        Finding {
+            file: path.into(),
+            line,
+            fact: "supported fact".into(),
+            quote: Some(quote.into()),
+            quote_omitted: false,
+            router_rank: None,
+            deterministic_score: 0.0,
+            match_tier: None,
+        }
+    }
+
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ScopedPath(Option<std::ffi::OsString>);
+
+    impl ScopedPath {
+        fn set(path: &Path) -> Self {
+            let previous = env::var_os("PATH");
+            unsafe { env::set_var("PATH", path) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ScopedPath {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                unsafe { env::set_var("PATH", path) };
+            } else {
+                unsafe { env::remove_var("PATH") };
+            }
         }
     }
 
