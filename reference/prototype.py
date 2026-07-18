@@ -159,7 +159,7 @@ def verify(
         if "error" in f:
             dropped.append(cast(DroppedFinding, {**f, "why": "unparseable"}))
             continue
-        text = files.get(f["file"], "")
+        text = files[f["file"]]
         q = norm(f.get("quote") or "")
         if not q or not f.get("fact"):
             dropped.append(cast(DroppedFinding, {**f, "why": "empty"}))
@@ -199,7 +199,7 @@ def scout(query: str, root: str, workers: int = 20) -> ScoutResult:
         "files": len(files), "chunks": len(jobs), "chunks_skipped": 0,
         "findings": kept, "dropped": dropped,
         "wall_s": round(time.time() - t0, 1),
-        "spend": cast(gemma.Spend, dict(gemma.spend)),
+        "spend": gemma.spend.copy(),
     }
 
 

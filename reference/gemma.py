@@ -56,10 +56,10 @@ class Spend(TypedDict):
     calls: int
 
 API = "https://api.cerebras.ai/v1/chat/completions"
-UA = "volley/0.1 (github.com/treygoff; experiment harness)"  # default urllib UA gets Cloudflare-403'd
+UA = "volley/0.1 (github.com/treygoff; experiment harness)"  # Cloudflare rejects urllib's default user agent.
 
 def _key() -> str:
-    # env first: ccp/ccw inject the active profile's key (personal vs work split)
+    # Prefer the injected profile key; .env is only the local fallback.
     if os.environ.get("CEREBRAS_API_KEY"):
         return os.environ["CEREBRAS_API_KEY"].strip()
     with open(os.path.join(os.path.dirname(__file__), ".env")) as f:

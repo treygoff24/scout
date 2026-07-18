@@ -1,6 +1,7 @@
-use serde_json::{Value, json};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn scout(args: &[&str], cwd: &Path) -> Output {
@@ -13,13 +14,19 @@ fn scout(args: &[&str], cwd: &Path) -> Output {
         .unwrap()
 }
 
-fn envelope(output: &Output) -> Value {
+fn parse_stdout<T: DeserializeOwned>(output: &Output) -> T {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
         panic!(
             "stdout was not one JSON envelope: {err}; stdout={}",
             String::from_utf8_lossy(&output.stdout)
         )
     })
+}
+
+#[derive(Deserialize)]
+struct EnvelopeHeader {
+    schema: String,
+    state: String,
 }
 
 #[test]
@@ -33,19 +40,77 @@ fn binary_error_paths_emit_one_envelope_with_matching_exit_codes() {
     ] {
         let output = scout(&args, dir.path());
         assert_eq!(output.status.code(), Some(code), "args={args:?}");
-        let body = envelope(&output);
-        assert_eq!(body["schema"], "scout.cli.response.v1", "args={args:?}");
-        assert_eq!(body["state"], state, "args={args:?}");
+        let body: EnvelopeHeader = parse_stdout(&output);
+        assert_eq!(body.schema, "scout.cli.response.v1", "args={args:?}");
+        assert_eq!(body.state, state, "args={args:?}");
         assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
     }
 }
 
-fn write_eval_suite(root: &Path, queries: Value) {
+#[derive(Serialize)]
+struct TestEvalSuite<'a> {
+    queries: &'a [TestEvalQuery],
+}
+
+#[derive(Serialize)]
+struct TestEvalQuery {
+    id: &'static str,
+    corpus_root: PathBuf,
+    query: &'static str,
+    must_find: Vec<TestGoldenFact>,
+    poison: Vec<TestGoldenPoison>,
+    negative: bool,
+}
+
+#[derive(Serialize)]
+struct TestGoldenFact {
+    fact: String,
+    file: String,
+    line: usize,
+}
+
+#[derive(Serialize)]
+struct TestGoldenPoison {
+    fact: String,
+}
+
+#[derive(Deserialize)]
+struct EvalEnvelope {
+    state: String,
+    data: EvalData,
+}
+
+#[derive(Deserialize)]
+struct EvalData {
+    results: Vec<TestEvalResult>,
+    metrics: TestEvalMetrics,
+    gate_results: TestEvalGateResults,
+    summary_path: String,
+}
+
+#[derive(Deserialize)]
+struct TestEvalResult {
+    #[serde(rename = "id")]
+    _id: String,
+}
+
+#[derive(Deserialize)]
+struct TestEvalMetrics {
+    candidate_file_recall: f64,
+    coverage: f64,
+}
+
+#[derive(Deserialize)]
+struct TestEvalGateResults {
+    suite_complete: bool,
+}
+
+fn write_eval_suite(root: &Path, queries: &[TestEvalQuery]) {
     let goldens = root.join("eval/goldens");
     fs::create_dir_all(&goldens).unwrap();
     fs::write(
         goldens.join("code.json"),
-        serde_json::to_vec(&json!({"queries": queries})).unwrap(),
+        serde_json::to_vec(&TestEvalSuite { queries }).unwrap(),
     )
     .unwrap();
 }
@@ -55,24 +120,23 @@ fn eval_zero_cap_stops_before_work_and_writes_a_partial_summary() {
     let dir = tempfile::tempdir().unwrap();
     write_eval_suite(
         dir.path(),
-        json!([{
-            "id": "q1",
-            "corpus_root": dir.path().join("corpus"),
-            "query": "anything",
-            "must_find": [],
-            "poison": [],
-            "negative": true
-        }]),
+        &[TestEvalQuery {
+            id: "q1",
+            corpus_root: dir.path().join("corpus"),
+            query: "anything",
+            must_find: Vec::new(),
+            poison: Vec::new(),
+            negative: true,
+        }],
     );
 
     let output = scout(&["eval", "m1", "--yes", "--max-dollars", "0"], dir.path());
     assert_eq!(output.status.code(), Some(3));
-    let body = envelope(&output);
-    assert_eq!(body["state"], "partial");
-    assert_eq!(body["data"]["results"], json!([]));
-    assert_eq!(body["data"]["metrics"]["candidate_file_recall"], 100.0);
-    assert_eq!(body["data"]["metrics"]["coverage"], 100.0);
-    assert_eq!(body["data"]["gate_results"]["suite_complete"], false);
-    let summary = body["data"]["summary_path"].as_str().unwrap();
-    assert!(dir.path().join(summary).is_file());
+    let body: EvalEnvelope = parse_stdout(&output);
+    assert_eq!(body.state, "partial");
+    assert!(body.data.results.is_empty());
+    assert_eq!(body.data.metrics.candidate_file_recall, 100.0);
+    assert_eq!(body.data.metrics.coverage, 100.0);
+    assert!(!body.data.gate_results.suite_complete);
+    assert!(dir.path().join(body.data.summary_path).is_file());
 }

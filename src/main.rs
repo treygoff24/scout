@@ -4,7 +4,6 @@ use rand::Rng;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -114,26 +113,29 @@ impl Spend {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Envelope {
+struct Envelope<D = EmptyData> {
     schema: String,
     state: String,
     command: String,
     root: Option<String>,
-    data: Value,
+    data: D,
     spend: Spend,
     timings_ms: BTreeMap<String, u128>,
     skipped: Vec<Skip>,
     errors: Vec<String>,
 }
 
-impl Envelope {
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct EmptyData {}
+
+impl Envelope<EmptyData> {
     fn new(command: &str, state: &str) -> Self {
         Self {
             schema: SCHEMA.to_string(),
             state: state.to_string(),
             command: command.to_string(),
             root: None,
-            data: json!({}),
+            data: EmptyData {},
             spend: Spend::default(),
             timings_ms: BTreeMap::new(),
             skipped: Vec::new(),
@@ -145,6 +147,22 @@ impl Envelope {
         Self {
             root: Some(root.display().to_string()),
             ..Self::new(command, state)
+        }
+    }
+}
+
+impl<D> Envelope<D> {
+    fn with_data<T>(self, data: T) -> Envelope<T> {
+        Envelope {
+            schema: self.schema,
+            state: self.state,
+            command: self.command,
+            root: self.root,
+            data,
+            spend: self.spend,
+            timings_ms: self.timings_ms,
+            skipped: self.skipped,
+            errors: self.errors,
         }
     }
 }
@@ -188,12 +206,12 @@ fn state_names() -> Vec<&'static str> {
     STATE_EXIT_CODES.iter().map(|(state, _)| *state).collect()
 }
 
-fn finish_env(env: &Envelope, pretty: bool) -> Result<i32> {
+fn finish_env<D: Serialize>(env: &Envelope<D>, pretty: bool) -> Result<i32> {
     emit(env, pretty)?;
     Ok(exit_code_for_state(&env.state))
 }
 
-fn with_exit_code(env: Envelope) -> (Envelope, i32) {
+fn with_exit_code<D>(env: Envelope<D>) -> (Envelope<D>, i32) {
     let code = exit_code_for_state(&env.state);
     (env, code)
 }
@@ -222,6 +240,8 @@ struct WalkedFile {
     adapter: String,
     hash: String,
 }
+
+type FileContents = HashMap<String, String>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Symbol {
@@ -274,7 +294,7 @@ struct Manifest {
     #[serde(default)]
     markdown_only: bool,
     #[serde(default)]
-    file_meta: BTreeMap<String, ManifestFileMeta>,
+    file_meta: ManifestFileMetadata,
     skipped: Vec<Skip>,
     unsupported: Vec<Skip>,
 }
@@ -284,6 +304,8 @@ struct ManifestFileMeta {
     size: u64,
     mtime_unix_ms: u128,
 }
+
+type ManifestFileMetadata = BTreeMap<String, ManifestFileMeta>;
 
 #[derive(Debug, Clone)]
 struct Snapshot {
@@ -295,6 +317,15 @@ struct Snapshot {
 struct Message {
     role: String,
     content: String,
+}
+
+#[derive(Serialize)]
+struct CerebrasRequest<'a> {
+    model: &'a str,
+    messages: &'a [Message],
+    stream: bool,
+    temperature: u8,
+    max_completion_tokens: u64,
 }
 
 impl Message {
@@ -376,13 +407,13 @@ impl CerebrasClient {
         max_tokens: u64,
         gate: Option<&BudgetGate>,
     ) -> Result<String> {
-        let body = json!({
-            "model": self.model,
-            "messages": messages,
-            "stream": false,
-            "temperature": 0,
-            "max_completion_tokens": max_tokens,
-        });
+        let body = CerebrasRequest {
+            model: &self.model,
+            messages: &messages,
+            stream: false,
+            temperature: 0,
+            max_completion_tokens: max_tokens,
+        };
         let mut retries = 0;
         for attempt in 0..6 {
             self.rate_limiter.wait();
@@ -823,6 +854,42 @@ fn parse_corpus_args(args: &[String], command: &str) -> Result<CorpusArgs> {
     Ok(parsed)
 }
 
+fn canonicalize_or_original(path: &str) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+#[derive(Serialize)]
+struct CostCapData {
+    estimated_usd: f64,
+    max_dollars: f64,
+}
+
+#[derive(Serialize)]
+struct HintData {
+    hint: &'static str,
+}
+
+#[derive(Serialize)]
+struct CancelledIndexData {
+    cancelled: bool,
+    estimated_usd: f64,
+}
+
+#[derive(Serialize)]
+struct FailedIndexData {
+    cards: usize,
+    estimated_usd: f64,
+    unsupported: Vec<Skip>,
+}
+
+#[derive(Serialize)]
+struct IndexData {
+    generation: String,
+    cards: usize,
+    estimated_usd: f64,
+    unsupported: Vec<Skip>,
+}
+
 fn cmd_index(args: &[String]) -> Result<i32> {
     let mut dir = ".".to_string();
     let mut yes = false;
@@ -863,9 +930,11 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     if let Some(cap) = max_dollars
         && estimate > cap
     {
-        let mut env = Envelope::for_root("index", "budget_hit", &root);
+        let mut env = Envelope::for_root("index", "budget_hit", &root).with_data(CostCapData {
+            estimated_usd: estimate,
+            max_dollars: cap,
+        });
         env.skipped = skipped;
-        env.data = json!({"estimated_usd": estimate, "max_dollars": cap});
         return finish_env(&env, pretty);
     }
     if !yes
@@ -873,8 +942,10 @@ fn cmd_index(args: &[String]) -> Result<i32> {
         && io::stdin().is_terminal()
         && !confirm_spend("Proceed with index spend? [y/N] ")?
     {
-        let mut env = Envelope::for_root("index", "budget_hit", &root);
-        env.data = json!({"cancelled": true, "estimated_usd": estimate});
+        let env = Envelope::for_root("index", "budget_hit", &root).with_data(CancelledIndexData {
+            cancelled: true,
+            estimated_usd: estimate,
+        });
         return finish_env(&env, pretty);
     }
 
@@ -940,7 +1011,11 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     };
     let state = index_state_after_card_generation(&cards, &skipped, &manifest.unsupported);
     if matches!(state, "provider_error" | "budget_hit") {
-        let mut env = Envelope::for_root("index", state, &root);
+        let mut env = Envelope::for_root("index", state, &root).with_data(FailedIndexData {
+            cards: 0,
+            estimated_usd: estimate,
+            unsupported: coverage_skips(&manifest),
+        });
         env.spend = spend.lock().unwrap().clone();
         env.skipped = skipped;
         env.errors.push(if state == "budget_hit" {
@@ -950,26 +1025,20 @@ fn cmd_index(args: &[String]) -> Result<i32> {
         });
         env.timings_ms
             .insert("total".into(), start.elapsed().as_millis());
-        env.data = json!({
-            "cards": 0,
-            "estimated_usd": estimate,
-            "unsupported": coverage_skips(&manifest),
-        });
         return finish_env(&env, pretty);
     }
     let gen_dir = write_generation(&root, &manifest, &cards)?;
     prune_generations(&root, 2).ok();
-    let mut env = Envelope::for_root("index", state, &root);
+    let mut env = Envelope::for_root("index", state, &root).with_data(IndexData {
+        generation: gen_dir.file_name().unwrap().to_string_lossy().into_owned(),
+        cards: manifest.cards,
+        estimated_usd: estimate,
+        unsupported: coverage_skips(&manifest),
+    });
     env.spend = spend.lock().unwrap().clone();
     env.skipped = skipped;
     env.timings_ms
         .insert("total".into(), start.elapsed().as_millis());
-    env.data = json!({
-        "generation": gen_dir.file_name().unwrap().to_string_lossy(),
-        "cards": manifest.cards,
-        "estimated_usd": estimate,
-        "unsupported": coverage_skips(&manifest),
-    });
     finish_env(&env, pretty)
 }
 
@@ -1104,22 +1173,161 @@ struct RefreshResult {
     generation: String,
 }
 
-fn merge_refresh_result(env: &mut Envelope, result: Option<&RefreshResult>) {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RefreshedIndexData {
+    estimated_usd: f64,
+    generation: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct QueryArtifactPaths {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_run_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct QueryRefreshData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_index: Option<RefreshedIndexData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueryResultData {
+    query: String,
+    generation: String,
+    candidate_files: Vec<String>,
+    chunks: usize,
+    chunk_mode: String,
+    findings: Vec<Finding>,
+    dropped: Vec<DroppedFinding>,
+    weak_signal: bool,
+    budget_hit: Option<String>,
+    #[serde(flatten)]
+    artifacts: QueryArtifactPaths,
+    #[serde(flatten)]
+    refresh: QueryRefreshData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EmptyQueryResultData {
+    query: String,
+    generation: String,
+    findings: Vec<Finding>,
+    dropped: Vec<DroppedFinding>,
+    candidate_files: Vec<String>,
+    weak_signal: bool,
+    #[serde(flatten)]
+    artifacts: QueryArtifactPaths,
+    #[serde(flatten)]
+    refresh: QueryRefreshData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StaleQueryData {
+    hint: String,
+    reason: String,
+    changed_files: usize,
+    #[serde(flatten)]
+    artifacts: QueryArtifactPaths,
+    #[serde(flatten)]
+    refresh: QueryRefreshData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BudgetQueryData {
+    estimated_usd: f64,
+    max_dollars: f64,
+    #[serde(flatten)]
+    artifacts: QueryArtifactPaths,
+    #[serde(flatten)]
+    refresh: QueryRefreshData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum QueryData {
+    Result(QueryResultData),
+    Empty(EmptyQueryResultData),
+    Stale(StaleQueryData),
+    Budget(BudgetQueryData),
+}
+
+impl QueryData {
+    fn findings(&self) -> Result<&[Finding]> {
+        match self {
+            Self::Result(data) => Ok(&data.findings),
+            Self::Empty(data) => Ok(&data.findings),
+            _ => bail!("query envelope missing data.findings"),
+        }
+    }
+
+    fn candidate_files(&self) -> Result<&[String]> {
+        match self {
+            Self::Result(data) => Ok(&data.candidate_files),
+            Self::Empty(data) => Ok(&data.candidate_files),
+            _ => bail!("query envelope missing data.candidate_files"),
+        }
+    }
+
+    fn artifact_paths_mut(&mut self) -> &mut QueryArtifactPaths {
+        match self {
+            Self::Result(data) => &mut data.artifacts,
+            Self::Empty(data) => &mut data.artifacts,
+            Self::Stale(data) => &mut data.artifacts,
+            Self::Budget(data) => &mut data.artifacts,
+        }
+    }
+
+    fn refresh_mut(&mut self) -> &mut QueryRefreshData {
+        match self {
+            Self::Result(data) => &mut data.refresh,
+            Self::Empty(data) => &mut data.refresh,
+            Self::Stale(data) => &mut data.refresh,
+            Self::Budget(data) => &mut data.refresh,
+        }
+    }
+
+    fn last_run_path(&self) -> Result<&str> {
+        let path = match self {
+            Self::Result(data) => data.artifacts.last_run_path.as_deref(),
+            Self::Empty(data) => data.artifacts.last_run_path.as_deref(),
+            Self::Stale(data) => data.artifacts.last_run_path.as_deref(),
+            Self::Budget(data) => data.artifacts.last_run_path.as_deref(),
+        };
+        path.context("query envelope missing data.last_run_path")
+    }
+}
+
+type QueryEnvelope = Envelope<QueryData>;
+
+fn merge_query_refresh_result(env: &mut QueryEnvelope, result: Option<&RefreshResult>) {
     let Some(result) = result else {
         return;
     };
     env.spend.merge(&result.spend);
-    insert_data_field(
-        &mut env.data,
-        "refreshed_index",
-        json!({"estimated_usd": result.estimated_usd, "generation": result.generation}),
-    );
+    env.data.refresh_mut().refreshed_index = Some(RefreshedIndexData {
+        estimated_usd: result.estimated_usd,
+        generation: result.generation.clone(),
+    });
+}
+
+#[derive(Serialize)]
+struct RefreshRefusedData {
+    hint: &'static str,
+    estimated_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_dollars: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_yes_max_usd: Option<f64>,
+    changed_files: usize,
 }
 
 enum RefreshDecision {
     NotNeeded,
     Refreshed(RefreshResult),
-    Refused(Envelope),
+    Refused(Envelope<RefreshRefusedData>),
 }
 
 fn refresh_index_if_needed(
@@ -1142,22 +1350,22 @@ fn refresh_index_if_needed(
     if let Some(cap) = max_dollars
         && estimate.usd > cap
     {
-        let mut env = Envelope::for_root(command, "budget_hit", root);
-        env.data = json!({
-            "hint": "run scout index --max-dollars with a higher cap",
-            "estimated_usd": estimate.usd,
-            "max_dollars": cap,
-            "changed_files": estimate.files_to_card,
+        let env = Envelope::for_root(command, "budget_hit", root).with_data(RefreshRefusedData {
+            hint: "run scout index --max-dollars with a higher cap",
+            estimated_usd: estimate.usd,
+            max_dollars: Some(cap),
+            auto_yes_max_usd: None,
+            changed_files: estimate.files_to_card,
         });
         return Ok(RefreshDecision::Refused(env));
     }
     if estimate.usd > REFRESH_AUTO_YES_MAX_USD {
-        let mut env = Envelope::for_root(command, "budget_hit", root);
-        env.data = json!({
-            "hint": "refresh estimate exceeds auto-confirm threshold; run scout index --yes first",
-            "estimated_usd": estimate.usd,
-            "auto_yes_max_usd": REFRESH_AUTO_YES_MAX_USD,
-            "changed_files": estimate.files_to_card,
+        let env = Envelope::for_root(command, "budget_hit", root).with_data(RefreshRefusedData {
+            hint: "refresh estimate exceeds auto-confirm threshold; run scout index --yes first",
+            estimated_usd: estimate.usd,
+            max_dollars: None,
+            auto_yes_max_usd: Some(REFRESH_AUTO_YES_MAX_USD),
+            changed_files: estimate.files_to_card,
         });
         return Ok(RefreshDecision::Refused(env));
     }
@@ -1178,7 +1386,7 @@ fn refresh_index_if_needed(
 fn cmd_query(args: &[String]) -> Result<i32> {
     let query = args[0].clone();
     let options = parse_corpus_args(&args[1..], "query")?;
-    let root = fs::canonicalize(&options.dir).unwrap_or_else(|_| PathBuf::from(&options.dir));
+    let root = canonicalize_or_original(&options.dir);
     let refresh_result = if options.refresh {
         match refresh_index_if_needed("query", &root, options.max_dollars, false)? {
             RefreshDecision::NotNeeded => None,
@@ -1194,7 +1402,7 @@ fn cmd_query(args: &[String]) -> Result<i32> {
     match query_once(&query, &root, query_max_dollars) {
         Ok((env, code)) => {
             let mut env = env;
-            merge_refresh_result(&mut env, refresh_result.as_ref());
+            merge_query_refresh_result(&mut env, refresh_result.as_ref());
             persist_query_artifacts(&root, &mut env)?;
             let emitted = finish_env(
                 &query_stdout_envelope(&env, options.budget_tokens, options.compact)?,
@@ -1212,18 +1420,21 @@ fn cmd_query(args: &[String]) -> Result<i32> {
     }
 }
 
-fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Envelope, i32)> {
+fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(QueryEnvelope, i32)> {
     let total_start = Instant::now();
     let snapshot = open_snapshot(root).map_err(|_| anyhow!("index_missing"))?;
     let cards = load_cards(&snapshot)?;
     let stale = staleness_report(root, &snapshot.manifest, &cards)?;
     if stale.stale {
-        let mut env = Envelope::for_root("query", "index_stale", root);
-        env.data = json!({
-            "hint": "run scout index --refresh",
-            "reason": stale.reason,
-            "changed_files": stale.changed_files,
-        });
+        let env = Envelope::for_root("query", "index_stale", root).with_data(QueryData::Stale(
+            StaleQueryData {
+                hint: "run scout index --refresh".into(),
+                reason: stale.reason,
+                changed_files: stale.changed_files,
+                artifacts: QueryArtifactPaths::default(),
+                refresh: QueryRefreshData::default(),
+            },
+        ));
         return Ok(with_exit_code(env));
     }
     let files = read_card_files(root, &cards)?;
@@ -1235,9 +1446,17 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
         "scout query estimate before router spend: ~${:.4}",
         router_estimate
     );
-    if max_dollars.is_some_and(|cap| router_estimate > cap) {
-        let mut env = Envelope::for_root("query", "budget_hit", root);
-        env.data = json!({"estimated_usd": router_estimate, "max_dollars": max_dollars});
+    if let Some(cap) = max_dollars
+        && router_estimate > cap
+    {
+        let env = Envelope::for_root("query", "budget_hit", root).with_data(QueryData::Budget(
+            BudgetQueryData {
+                estimated_usd: router_estimate,
+                max_dollars: cap,
+                artifacts: QueryArtifactPaths::default(),
+                refresh: QueryRefreshData::default(),
+            },
+        ));
         return Ok(with_exit_code(env));
     }
     let spend = Arc::new(Mutex::new(Spend::default()));
@@ -1254,18 +1473,26 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
     let candidates = final_candidates(router, deterministic, &cards);
     let candidate_paths: Vec<String> = candidates.iter().map(|c| c.path.clone()).collect();
     if candidates.is_empty() {
-        let mut env = Envelope::for_root("query", "unanswered", root);
+        let mut env = Envelope::for_root("query", "unanswered", root).with_data(QueryData::Empty(
+            EmptyQueryResultData {
+                query: query.into(),
+                generation: snapshot
+                    .gen_dir
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                findings: Vec::new(),
+                dropped: Vec::new(),
+                candidate_files: Vec::new(),
+                weak_signal: false,
+                artifacts: QueryArtifactPaths::default(),
+                refresh: QueryRefreshData::default(),
+            },
+        ));
         env.spend = spend.lock().unwrap().clone();
         env.timings_ms
             .insert("total".into(), total_start.elapsed().as_millis());
-        env.data = json!({
-            "query": query,
-            "generation": snapshot.gen_dir.file_name().unwrap().to_string_lossy(),
-            "findings": [],
-            "dropped": [],
-            "candidate_files": [],
-            "weak_signal": false,
-        });
         return Ok(with_exit_code(env));
     }
     let mode = env::var("SCOUT_CHUNK_MODE").unwrap_or_else(|_| "ranked_boundary".into());
@@ -1284,7 +1511,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
                 .unwrap_or(DEFAULT_CONCURRENCY),
         )
         .build()?;
-    let results: Vec<Result<Vec<Finding>, DroppedFinding>> = pool.install(|| {
+    let results: Vec<_> = pool.install(|| {
         chunks
             .par_iter()
             .map(|chunk| extract_chunk(&client, &gate, query, chunk))
@@ -1313,22 +1540,29 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
     let weak_signal = is_weak_signal(&findings, top_candidate_deterministic_score(&candidates));
     let budget_hit = gate.hit();
     let state = query_state(budget_hit.is_some(), chunks.len(), findings.len(), &dropped);
-    let mut env = Envelope::for_root("query", state, root);
+    let mut env =
+        Envelope::for_root("query", state, root).with_data(QueryData::Result(QueryResultData {
+            query: query.into(),
+            generation: snapshot
+                .gen_dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            candidate_files: candidate_paths,
+            chunks: chunks.len(),
+            chunk_mode: mode,
+            findings,
+            dropped,
+            weak_signal,
+            budget_hit,
+            artifacts: QueryArtifactPaths::default(),
+            refresh: QueryRefreshData::default(),
+        }));
     env.spend = spend.lock().unwrap().clone();
     env.skipped = snapshot.manifest.skipped.clone();
     env.timings_ms
         .insert("total".into(), total_start.elapsed().as_millis());
-    env.data = json!({
-        "query": query,
-        "generation": snapshot.gen_dir.file_name().unwrap().to_string_lossy(),
-        "candidate_files": candidate_paths,
-        "chunks": chunks.len(),
-        "chunk_mode": mode,
-        "findings": findings,
-        "dropped": dropped,
-        "weak_signal": weak_signal,
-        "budget_hit": budget_hit,
-    });
     let code = exit_code_for_state(&env.state);
     Ok((env, code))
 }
@@ -1434,28 +1668,84 @@ Rules:
 Return JSON only, no prose or markdown fence."#;
 
 #[derive(Serialize)]
-struct BriefModuleEntry<'a> {
-    path: &'a str,
-    role: &'a ModelHint<String>,
-    symbols: &'a [Symbol],
-    outline: &'a [OutlineItem],
+struct BriefModuleEntry {
+    path: String,
+    role: ModelHint<String>,
+    symbols: Vec<Symbol>,
+    outline: Vec<OutlineItem>,
     loc: usize,
     churn: u32,
     harness_meta: bool,
 }
 
 #[derive(Serialize)]
-struct BriefEntryPoint<'a> {
-    path: &'a str,
-    role: &'a ModelHint<String>,
+struct BriefEntryPoint {
+    path: String,
+    role: ModelHint<String>,
     imports: usize,
     churn: u32,
     harness_meta: bool,
 }
 
+#[derive(Serialize)]
+struct BriefData {
+    generation: String,
+    module_map: BTreeMap<String, Vec<BriefModuleEntry>>,
+    entry_points: Vec<BriefEntryPoint>,
+    unsupported: Vec<Skip>,
+    coverage_note: String,
+    stale: bool,
+    stale_reason: Option<String>,
+    changed_files: usize,
+}
+
+#[derive(Serialize)]
+struct FullBriefOutputData {
+    #[serde(flatten)]
+    brief: BriefData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_index: Option<RefreshedIndexData>,
+}
+
+#[derive(Serialize)]
+struct TruncatedBriefOutputData {
+    truncated: bool,
+    preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_index: Option<RefreshedIndexData>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum BriefOutputData {
+    Full(FullBriefOutputData),
+    Truncated(TruncatedBriefOutputData),
+}
+
+fn brief_output_data(
+    brief: BriefData,
+    budget_tokens: Option<usize>,
+    refreshed_index: Option<RefreshedIndexData>,
+) -> BriefOutputData {
+    if let Some(tokens) = budget_tokens {
+        let serialized = serde_json::to_string(&brief).unwrap();
+        if estimate_tokens(&serialized) > tokens {
+            return BriefOutputData::Truncated(TruncatedBriefOutputData {
+                truncated: true,
+                preview: truncate_chars(&serialized, tokens * 4),
+                refreshed_index,
+            });
+        }
+    }
+    BriefOutputData::Full(FullBriefOutputData {
+        brief,
+        refreshed_index,
+    })
+}
+
 fn cmd_brief(args: &[String]) -> Result<i32> {
     let options = parse_corpus_args(args, "brief")?;
-    let root = fs::canonicalize(&options.dir).unwrap_or_else(|_| PathBuf::from(&options.dir));
+    let root = canonicalize_or_original(&options.dir);
     let refresh_result = if options.refresh {
         match refresh_index_if_needed("brief", &root, options.max_dollars, false)? {
             RefreshDecision::NotNeeded => None,
@@ -1468,15 +1758,16 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
     let snapshot = match open_snapshot(&root) {
         Ok(s) => s,
         Err(_) => {
-            let mut env = Envelope::for_root("brief", "index_missing", &root);
-            env.data = json!({"hint": "run scout index"});
+            let env = Envelope::for_root("brief", "index_missing", &root).with_data(HintData {
+                hint: "run scout index",
+            });
             return finish_env(&env, options.pretty);
         }
     };
     let mut cards = load_cards(&snapshot)?;
     cards.sort_by(|a, b| a.path.cmp(&b.path));
     let stale = staleness_report(&root, &snapshot.manifest, &cards)?;
-    let mut dirs: BTreeMap<String, Vec<BriefModuleEntry<'_>>> = BTreeMap::new();
+    let mut dirs: BTreeMap<String, Vec<BriefModuleEntry>> = BTreeMap::new();
     for c in &cards {
         let dir = Path::new(&c.path)
             .parent()
@@ -1484,10 +1775,10 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| ".".into());
         dirs.entry(dir).or_default().push(BriefModuleEntry {
-            path: &c.path,
-            role: &c.role,
-            symbols: &c.symbols[..c.symbols.len().min(8)],
-            outline: &c.outline[..c.outline.len().min(8)],
+            path: c.path.clone(),
+            role: c.role.clone(),
+            symbols: c.symbols[..c.symbols.len().min(8)].to_vec(),
+            outline: c.outline[..c.outline.len().min(8)].to_vec(),
             loc: c.loc,
             churn: c.churn,
             harness_meta: c.harness_meta,
@@ -1498,8 +1789,8 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
         .iter()
         .take(20)
         .map(|c| BriefEntryPoint {
-            path: &c.path,
-            role: &c.role,
+            path: c.path.clone(),
+            role: c.role.clone(),
             imports: c.imports.len(),
             churn: c.churn,
             harness_meta: c.harness_meta,
@@ -1507,25 +1798,34 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
         .collect();
     let unsupported = coverage_skips(&snapshot.manifest);
     let stale_reason = stale.stale.then(|| stale.reason.clone());
-    let data = json!({
-        "generation": snapshot.gen_dir.file_name().unwrap().to_string_lossy(),
-        "module_map": dirs,
-        "entry_points": entry_points,
-        "unsupported": unsupported,
-        "coverage_note": coverage_note(&unsupported),
-        "stale": stale.stale,
-        "stale_reason": stale_reason,
-        "changed_files": stale.changed_files,
-    });
-    let packed = if let Some(tokens) = options.budget_tokens {
-        truncate_json_value(data, tokens)
-    } else {
-        data
+    let data = BriefData {
+        generation: snapshot
+            .gen_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        module_map: dirs,
+        entry_points,
+        coverage_note: coverage_note(&unsupported),
+        unsupported,
+        stale: stale.stale,
+        stale_reason,
+        changed_files: stale.changed_files,
     };
-    let mut env = Envelope::for_root("brief", "ok", &root);
+    let refreshed_index = refresh_result.as_ref().map(|result| RefreshedIndexData {
+        estimated_usd: result.estimated_usd,
+        generation: result.generation.clone(),
+    });
+    let mut env = Envelope::for_root("brief", "ok", &root).with_data(brief_output_data(
+        data,
+        options.budget_tokens,
+        refreshed_index,
+    ));
     env.skipped = snapshot.manifest.skipped.clone();
-    env.data = packed;
-    merge_refresh_result(&mut env, refresh_result.as_ref());
+    if let Some(result) = &refresh_result {
+        env.spend.merge(&result.spend);
+    }
     finish_env(&env, options.pretty)
 }
 
@@ -1542,62 +1842,261 @@ fn brief_entry_points(cards: &[Card]) -> Vec<Card> {
     entry_points
 }
 
+#[derive(Serialize)]
+struct AdapterCapabilities {
+    code: &'static str,
+    markdown: &'static str,
+    pdf: &'static str,
+    docx: &'static str,
+}
+
+#[derive(Serialize)]
+struct CapabilityFlags {
+    query: &'static [&'static str],
+    brief: &'static [&'static str],
+    index: &'static [&'static str],
+}
+
+#[derive(Serialize)]
+struct QueryArtifactCapabilities {
+    last_run: &'static str,
+    history: &'static str,
+    kept: usize,
+}
+
+#[derive(Serialize)]
+struct CapabilitiesData {
+    provider: &'static str,
+    default_model: &'static str,
+    env_keys: &'static [&'static str],
+    content_leaves_machine: &'static [&'static str],
+    sensitive_deny: &'static [&'static str],
+    redaction: &'static [&'static str],
+    adapters: AdapterCapabilities,
+    states: Vec<&'static str>,
+    exit_codes: BTreeMap<&'static str, i32>,
+    flags: CapabilityFlags,
+    query_artifacts: QueryArtifactCapabilities,
+}
+
+#[derive(Serialize)]
+struct EnvelopeSchemaData {
+    schema: &'static str,
+    state: String,
+    data: &'static str,
+}
+
+#[derive(Serialize)]
+struct FindingSchemaData {
+    file: &'static str,
+    line: &'static str,
+    fact: &'static str,
+    quote: &'static str,
+    quote_omitted: &'static str,
+    match_tier: &'static str,
+    deterministic_score: &'static str,
+    router_rank: &'static str,
+}
+
+#[derive(Serialize)]
+struct QuerySchemaData {
+    weak_signal: &'static str,
+    dropped: &'static str,
+    changed_files: &'static str,
+}
+
+#[derive(Serialize)]
+struct BriefSchemaData {
+    stale: &'static str,
+    stale_reason: &'static str,
+    changed_files: &'static str,
+}
+
+#[derive(Serialize)]
+struct SchemaData {
+    envelope: EnvelopeSchemaData,
+    exit_codes: BTreeMap<&'static str, i32>,
+    card_schema_version: u32,
+    finding: FindingSchemaData,
+    query_data: QuerySchemaData,
+    brief_data: BriefSchemaData,
+    last_run: &'static str,
+}
+
+#[derive(Serialize)]
+struct ToolAvailability {
+    ctags: bool,
+    pdftotext: bool,
+    pandoc: bool,
+}
+
+#[derive(Serialize)]
+struct DoctorIndexData {
+    generation: String,
+    cards: usize,
+}
+
+#[derive(Serialize)]
+struct DegradedAdapters {
+    code_symbols: bool,
+    pdf: bool,
+    docx: bool,
+}
+
+#[derive(Serialize)]
+struct DoctorData {
+    api_key_present: bool,
+    model: String,
+    user_agent: &'static str,
+    tools: ToolAvailability,
+    index: Option<DoctorIndexData>,
+    degraded: DegradedAdapters,
+}
+
 fn cmd_capabilities(args: &[String]) -> Result<i32> {
     let pretty = parse_pretty_only(args, "capabilities")?;
-    let mut env = Envelope::new("capabilities", "ok");
-    env.data = json!({
-        "provider": "cerebras",
-        "default_model": DEFAULT_MODEL,
-        "env_keys": ["CEREBRAS_API_KEY", "SCOUT_API_KEY", "SCOUT_MODEL"],
-        "content_leaves_machine": ["index card prompts for non-sensitive files", "router thin cards", "redacted extraction chunks"],
-        "sensitive_deny": [".env*", "*.env", "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*", ".ssh/", ".aws/", ".config/gcloud/", ".kube/", ".docker/", ".gnupg/", ".azure/", ".netrc", ".npmrc", ".pypirc", ".pgpass", ".htpasswd", "*.pem", "*.key", "*.p12", "*.crt", "*.cer", "*.pfx", "*.jks", "*.keystore", "*.ppk", "*.asc", "*.gpg"],
-        "redaction": ["known token formats", "bearer tokens", "key/value secrets", "JWT", "high-entropy strings", "emails", "home paths"],
-        "adapters": {"code": "regex skeleton; ctags optional doctor signal", "markdown": "headings/links", "pdf": "pdftotext if installed", "docx": "pandoc if installed"},
-        "states": state_names(),
-        "exit_codes": exit_codes(),
-        "flags": {
-            "query": ["--budget", "--max-dollars", "--refresh", "--compact", "--pretty", "--query"],
-            "brief": ["--budget", "--max-dollars", "--refresh", "--pretty"],
-            "index": ["--yes", "--max-dollars", "--pretty"]
+    let env = Envelope::new("capabilities", "ok").with_data(CapabilitiesData {
+        provider: "cerebras",
+        default_model: DEFAULT_MODEL,
+        env_keys: &["CEREBRAS_API_KEY", "SCOUT_API_KEY", "SCOUT_MODEL"],
+        content_leaves_machine: &[
+            "index card prompts for non-sensitive files",
+            "router thin cards",
+            "redacted extraction chunks",
+        ],
+        sensitive_deny: &[
+            ".env*",
+            "*.env",
+            "id_rsa*",
+            "id_ed25519*",
+            "id_ecdsa*",
+            "id_dsa*",
+            ".ssh/",
+            ".aws/",
+            ".config/gcloud/",
+            ".kube/",
+            ".docker/",
+            ".gnupg/",
+            ".azure/",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            ".pgpass",
+            ".htpasswd",
+            "*.pem",
+            "*.key",
+            "*.p12",
+            "*.crt",
+            "*.cer",
+            "*.pfx",
+            "*.jks",
+            "*.keystore",
+            "*.ppk",
+            "*.asc",
+            "*.gpg",
+        ],
+        redaction: &[
+            "known token formats",
+            "bearer tokens",
+            "key/value secrets",
+            "JWT",
+            "high-entropy strings",
+            "emails",
+            "home paths",
+        ],
+        adapters: AdapterCapabilities {
+            code: "regex skeleton; ctags optional doctor signal",
+            markdown: "headings/links",
+            pdf: "pdftotext if installed",
+            docx: "pandoc if installed",
         },
-        "query_artifacts": { "last_run": ".scout/last-run.json", "history": ".scout/runs/*.json", "kept": 20 },
+        states: state_names(),
+        exit_codes: exit_codes(),
+        flags: CapabilityFlags {
+            query: &[
+                "--budget",
+                "--max-dollars",
+                "--refresh",
+                "--compact",
+                "--pretty",
+                "--query",
+            ],
+            brief: &["--budget", "--max-dollars", "--refresh", "--pretty"],
+            index: &["--yes", "--max-dollars", "--pretty"],
+        },
+        query_artifacts: QueryArtifactCapabilities {
+            last_run: ".scout/last-run.json",
+            history: ".scout/runs/*.json",
+            kept: 20,
+        },
     });
     finish_env(&env, pretty)
 }
 
 fn cmd_schema(args: &[String]) -> Result<i32> {
     let pretty = parse_pretty_only(args, "schema")?;
-    let mut env = Envelope::new("schema", "ok");
-    env.data = json!({
-        "envelope": {"schema": SCHEMA, "state": state_names().join("|"), "data": "command-specific"},
-        "exit_codes": exit_codes(),
-        "card_schema_version": CARD_SCHEMA_VERSION,
-        "finding": {"file": "relative path", "line": "1-based source line", "fact": "model text supported by quote", "quote": "verbatim unless omitted", "quote_omitted": "true when budget packed", "match_tier": "exact|markdown_normalized", "deterministic_score": "omitted only with --compact", "router_rank": "omitted only with --compact"},
-        "query_data": {"weak_signal": "true when max finding deterministic_score is below 40% of the top candidate deterministic score", "dropped": "array, or {reason: count} with --compact", "changed_files": "present on index_stale"},
-        "brief_data": {"stale": "bool", "stale_reason": "null|manifest_mismatch|content_hash_mismatch", "changed_files": "files changed vs manifest"},
-        "last_run": ".scout/last-run.json and .scout/runs/*.json contain full query envelopes",
+    let env = Envelope::new("schema", "ok").with_data(SchemaData {
+        envelope: EnvelopeSchemaData {
+            schema: SCHEMA,
+            state: state_names().join("|"),
+            data: "command-specific",
+        },
+        exit_codes: exit_codes(),
+        card_schema_version: CARD_SCHEMA_VERSION,
+        finding: FindingSchemaData {
+            file: "relative path",
+            line: "1-based source line",
+            fact: "model text supported by quote",
+            quote: "verbatim unless omitted",
+            quote_omitted: "true when budget packed",
+            match_tier: "exact|markdown_normalized",
+            deterministic_score: "omitted only with --compact",
+            router_rank: "omitted only with --compact",
+        },
+        query_data: QuerySchemaData {
+            weak_signal: "true when max finding deterministic_score is below 40% of the top candidate deterministic score",
+            dropped: "array, or {reason: count} with --compact",
+            changed_files: "present on index_stale",
+        },
+        brief_data: BriefSchemaData {
+            stale: "bool",
+            stale_reason: "null|manifest_mismatch|content_hash_mismatch",
+            changed_files: "files changed vs manifest",
+        },
+        last_run: ".scout/last-run.json and .scout/runs/*.json contain full query envelopes",
     });
     finish_env(&env, pretty)
 }
 
 fn cmd_doctor(args: &[String]) -> Result<i32> {
     let pretty = parse_pretty_only(args, "doctor")?;
-    let root = fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from("."));
-    let mut env = Envelope::new("doctor", "ok");
-    let tools = json!({
-        "ctags": command_exists("ctags"),
-        "pdftotext": command_exists("pdftotext"),
-        "pandoc": command_exists("pandoc"),
-    });
+    let root = canonicalize_or_original(".");
+    let tools = ToolAvailability {
+        ctags: command_exists("ctags"),
+        pdftotext: command_exists("pdftotext"),
+        pandoc: command_exists("pandoc"),
+    };
     let has_key = env::var("CEREBRAS_API_KEY").is_ok() || env::var("SCOUT_API_KEY").is_ok();
     let index = open_snapshot(&root).ok();
-    env.data = json!({
-        "api_key_present": has_key,
-        "model": env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
-        "user_agent": USER_AGENT,
-        "tools": tools,
-        "index": index.as_ref().map(|s| json!({"generation": s.gen_dir.file_name().unwrap().to_string_lossy(), "cards": s.manifest.cards})),
-        "degraded": {"code_symbols": !command_exists("ctags"), "pdf": !command_exists("pdftotext"), "docx": !command_exists("pandoc")},
+    let mut env = Envelope::new("doctor", "ok").with_data(DoctorData {
+        api_key_present: has_key,
+        model: env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
+        user_agent: USER_AGENT,
+        tools,
+        index: index.map(|snapshot| DoctorIndexData {
+            generation: snapshot
+                .gen_dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            cards: snapshot.manifest.cards,
+        }),
+        degraded: DegradedAdapters {
+            code_symbols: !command_exists("ctags"),
+            pdf: !command_exists("pdftotext"),
+            docx: !command_exists("pandoc"),
+        },
     });
     if !has_key {
         env.state = "provider_error".into();
@@ -1694,8 +2193,8 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
         )?;
         persist_query_artifacts(Path::new(&q.corpus_root), &mut env)?;
         total_spend.merge(&env.spend);
-        let findings: Vec<Finding> = data_vec(&env.data, "findings")?;
-        let candidate_files: Vec<String> = data_vec(&env.data, "candidate_files")?;
+        let findings = env.data.findings()?;
+        let candidate_files = env.data.candidate_files()?.to_vec();
         let must_files = q
             .must_find
             .iter()
@@ -1704,12 +2203,12 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
         let covered = q
             .must_find
             .iter()
-            .filter(|g| finding_covers(g, &findings))
+            .filter(|g| finding_covers(g, findings))
             .count();
         let poison_survivors = q
             .poison
             .iter()
-            .filter(|p| poison_survives(&p.fact, &q.query, &findings))
+            .filter(|p| poison_survives(&p.fact, &q.query, findings))
             .count();
         let artifact_path = write_eval_artifact(&eval_dir, q, &env)?;
         results.push(EvalResult {
@@ -1775,35 +2274,43 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
         avg_usd_per_query: cost_pass,
     };
     let summary_path = eval_dir.join("summary.json");
+    let per_query_artifacts = results
+        .iter()
+        .map(|result| EvalArtifactSummary {
+            id: &result.id,
+            state: &result.state,
+            artifact_path: &result.artifact_path,
+            candidate_file_recall_pass: result.must_files_present == result.must_files_total,
+            coverage_pass: result.coverage == result.coverage_total,
+            poison_pass: result.poison_survivors == 0,
+            negative_clean: result.negative_clean,
+        })
+        .collect();
     atomic_write(
         &summary_path,
-        &serde_json::to_vec_pretty(&json!({
-            "milestone": milestone,
-            "metrics": metrics,
-            "gate_results": gate_results,
-            "total_spend": total_spend,
-            "per_query_artifacts": results.iter().map(|result| json!({
-                "id": result.id,
-                "state": result.state,
-                "artifact_path": result.artifact_path,
-                "candidate_file_recall_pass": result.must_files_present == result.must_files_total,
-                "coverage_pass": result.coverage == result.coverage_total,
-                "poison_pass": result.poison_survivors == 0,
-                "negative_clean": result.negative_clean,
-            })).collect::<Vec<_>>(),
-        }))?,
+        &serde_json::to_vec_pretty(&EvalSummary {
+            milestone,
+            metrics: &metrics,
+            gate_results: &gate_results,
+            total_spend: &total_spend,
+            per_query_artifacts,
+        })?,
     )?;
-    let mut env = Envelope::new("eval", if green { "ok" } else { "partial" });
-    env.spend = total_spend;
-    env.data = json!({
-        "milestone": milestone,
-        "results": results,
-        "metrics": metrics,
-        "bars": {"candidate_file_recall": "100%", "coverage": ">=71.4%", "poison_survivors": 0, "avg_usd_per_query": "<0.15"},
-        "gate_results": gate_results,
-        "eval_run_dir": eval_dir,
-        "summary_path": summary_path,
+    let mut env = Envelope::new("eval", if green { "ok" } else { "partial" }).with_data(EvalData {
+        milestone: milestone.into(),
+        results,
+        metrics,
+        bars: EvalBars {
+            candidate_file_recall: "100%",
+            coverage: ">=71.4%",
+            poison_survivors: 0,
+            avg_usd_per_query: "<0.15",
+        },
+        gate_results,
+        eval_run_dir: eval_dir.display().to_string(),
+        summary_path: summary_path.display().to_string(),
     });
+    env.spend = total_spend;
     finish_env(&env, pretty)
 }
 
@@ -1820,7 +2327,7 @@ fn cmd_index_internal(root: &str, max_dollars: Option<f64>, markdown_only: bool)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()?;
-    let env: Envelope = serde_json::from_slice(&output.stdout)?;
+    let env: EnvelopeHeader = serde_json::from_slice(&output.stdout)?;
     if let Some(err) = index_subprocess_error(output.status.code(), &env, &output.stdout) {
         return Err(err);
     }
@@ -1836,7 +2343,7 @@ fn index_subprocess_failed(status_code: Option<i32>, state: &str) -> bool {
 
 fn index_subprocess_error(
     status_code: Option<i32>,
-    env: &Envelope,
+    env: &EnvelopeHeader,
     stdout: &[u8],
 ) -> Option<anyhow::Error> {
     if !index_subprocess_failed(status_code, &env.state) {
@@ -1919,25 +2426,73 @@ struct EvalGateResults {
     avg_usd_per_query: bool,
 }
 
+#[derive(Deserialize)]
+struct EnvelopeHeader {
+    state: String,
+    spend: Spend,
+}
+
+#[derive(Serialize)]
+struct EvalArtifactSummary<'a> {
+    id: &'a str,
+    state: &'a str,
+    artifact_path: &'a str,
+    candidate_file_recall_pass: bool,
+    coverage_pass: bool,
+    poison_pass: bool,
+    negative_clean: bool,
+}
+
+#[derive(Serialize)]
+struct EvalSummary<'a> {
+    milestone: &'a str,
+    metrics: &'a EvalMetrics,
+    gate_results: &'a EvalGateResults,
+    total_spend: &'a Spend,
+    per_query_artifacts: Vec<EvalArtifactSummary<'a>>,
+}
+
+#[derive(Serialize)]
+struct EvalBars {
+    candidate_file_recall: &'static str,
+    coverage: &'static str,
+    poison_survivors: usize,
+    avg_usd_per_query: &'static str,
+}
+
+#[derive(Serialize)]
+struct EvalData {
+    milestone: String,
+    results: Vec<EvalResult>,
+    metrics: EvalMetrics,
+    bars: EvalBars,
+    gate_results: EvalGateResults,
+    eval_run_dir: String,
+    summary_path: String,
+}
+
 fn load_eval_suite(path: &Path) -> Result<EvalSuite> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
-fn write_eval_artifact(dir: &Path, query: &EvalQuery, env: &Envelope) -> Result<String> {
-    let last_run_path = env
-        .data
-        .get("last_run_path")
-        .and_then(Value::as_str)
-        .context("query envelope missing data.last_run_path")?;
-    let last_run: Envelope = serde_json::from_str(&fs::read_to_string(last_run_path)?)?;
+#[derive(Serialize)]
+struct EvalArtifact<'a> {
+    query: &'a EvalQuery,
+    envelope: &'a QueryEnvelope,
+    last_run: QueryEnvelope,
+}
+
+fn write_eval_artifact(dir: &Path, query: &EvalQuery, env: &QueryEnvelope) -> Result<String> {
+    let last_run: QueryEnvelope =
+        serde_json::from_str(&fs::read_to_string(env.data.last_run_path()?)?)?;
     let path = dir.join(format!("{}.json", query.id));
     fs::write(
         &path,
-        serde_json::to_vec_pretty(&json!({
-            "query": query,
-            "envelope": env,
-            "last_run": last_run,
-        }))?,
+        serde_json::to_vec_pretty(&EvalArtifact {
+            query,
+            envelope: env,
+            last_run,
+        })?,
     )?;
     Ok(path.display().to_string())
 }
@@ -2707,7 +3262,7 @@ fn load_cards(snapshot: &Snapshot) -> Result<Vec<Card>> {
         .collect()
 }
 
-fn read_card_files(root: &Path, cards: &[Card]) -> Result<HashMap<String, String>> {
+fn read_card_files(root: &Path, cards: &[Card]) -> Result<FileContents> {
     cards
         .iter()
         .map(|c| {
@@ -2717,7 +3272,7 @@ fn read_card_files(root: &Path, cards: &[Card]) -> Result<HashMap<String, String
         .collect()
 }
 
-fn manifest_file_meta(root: &Path, files: &[WalkedFile]) -> BTreeMap<String, ManifestFileMeta> {
+fn manifest_file_meta(root: &Path, files: &[WalkedFile]) -> ManifestFileMetadata {
     files
         .iter()
         .filter_map(|f| file_meta(root, &f.rel).map(|meta| (f.rel.clone(), meta)))
@@ -2740,10 +3295,7 @@ fn modified_unix_ms(meta: &fs::Metadata) -> u128 {
         .unwrap_or_default()
 }
 
-fn walk_corpus_file_meta(
-    root: &Path,
-    markdown_only: bool,
-) -> Result<BTreeMap<String, ManifestFileMeta>> {
+fn walk_corpus_file_meta(root: &Path, markdown_only: bool) -> Result<ManifestFileMetadata> {
     let mut out = BTreeMap::new();
     for entry in corpus_walk_builder(root).build() {
         let entry = entry?;
@@ -2920,16 +3472,33 @@ fn route_with_model(
 }
 
 fn thin_cards_json(query: &str, cards: &[Card]) -> String {
-    serde_json::to_string(&json!({
-        "query": query,
-        "cards": cards.iter().map(|c| json!({"path": c.path, "role": card_role(&c.role.value)})).collect::<Vec<_>>()
-    })).unwrap()
+    #[derive(Serialize)]
+    struct ThinCard<'a> {
+        path: &'a str,
+        role: String,
+    }
+    #[derive(Serialize)]
+    struct ThinCards<'a> {
+        query: &'a str,
+        cards: Vec<ThinCard<'a>>,
+    }
+    serde_json::to_string(&ThinCards {
+        query,
+        cards: cards
+            .iter()
+            .map(|card| ThinCard {
+                path: &card.path,
+                role: card_role(&card.role.value),
+            })
+            .collect(),
+    })
+    .unwrap()
 }
 
 fn deterministic_candidates(
     query: &str,
     cards: &[Card],
-    files: &HashMap<String, String>,
+    files: &FileContents,
     limit: usize,
 ) -> Vec<Candidate> {
     let qterms = terms(query);
@@ -2949,10 +3518,7 @@ fn deterministic_candidates(
                     .map(|s| s.name.as_str())
                     .collect::<Vec<_>>()
                     .join(" "),
-                files
-                    .get(&c.path)
-                    .map(|s| truncate_chars(s, 20_000))
-                    .unwrap_or_default()
+                truncate_chars(&files[&c.path], 20_000)
             );
             let set: HashSet<String> = terms(&text).into_iter().collect();
             for t in &qterms {
@@ -3052,7 +3618,7 @@ fn top_candidate_deterministic_score(candidates: &[Candidate]) -> f64 {
 
 fn build_chunks(
     candidates: &[Candidate],
-    files: &HashMap<String, String>,
+    files: &FileContents,
     mode: &str,
     query: &str,
 ) -> Vec<Chunk> {
@@ -3063,14 +3629,12 @@ fn build_chunks(
         mode
     };
     for c in candidates {
-        if let Some(text) = files.get(&c.path) {
-            for (first_line, body) in chunks_for(&c.path, text, chunk_mode) {
-                chunks.push(Chunk {
-                    candidate: c.clone(),
-                    first_line,
-                    body,
-                });
-            }
+        for (first_line, body) in chunks_for(&c.path, &files[&c.path], chunk_mode) {
+            chunks.push(Chunk {
+                candidate: c.clone(),
+                first_line,
+                body,
+            });
         }
     }
     if mode == "ranked_boundary" {
@@ -3214,15 +3778,12 @@ fn numbered_lines(lines: &[&str], first_line: usize) -> String {
 
 fn verify_quotes(
     findings: Vec<Finding>,
-    files: &HashMap<String, String>,
+    files: &FileContents,
 ) -> (Vec<Finding>, Vec<DroppedFinding>) {
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for mut f in findings {
-        let Some(text) = files.get(&f.file) else {
-            dropped.push(drop_reason(&f, "file_missing"));
-            continue;
-        };
+        let text = &files[&f.file];
         let q = norm(f.quote.as_deref().unwrap_or(""));
         if q.is_empty() || f.fact.trim().is_empty() {
             dropped.push(drop_reason(&f, "empty"));
@@ -3359,7 +3920,7 @@ fn is_weak_signal(findings: &[Finding], top_candidate_score: f64) -> bool {
             < top_candidate_score * 0.4
 }
 
-fn persist_query_artifacts(root: &Path, env: &mut Envelope) -> Result<()> {
+fn persist_query_artifacts(root: &Path, env: &mut QueryEnvelope) -> Result<()> {
     let scout = root.join(".scout");
     fs::create_dir_all(&scout)?;
     let runs = scout.join("runs");
@@ -3373,16 +3934,9 @@ fn persist_query_artifacts(root: &Path, env: &mut Envelope) -> Result<()> {
         stamp += 1;
     };
     let last_path = scout.join("last-run.json");
-    insert_data_field(
-        &mut env.data,
-        "last_run_path",
-        json!(last_path.display().to_string()),
-    );
-    insert_data_field(
-        &mut env.data,
-        "run_path",
-        json!(run_path.display().to_string()),
-    );
+    let artifacts = env.data.artifact_paths_mut();
+    artifacts.last_run_path = Some(last_path.display().to_string());
+    artifacts.run_path = Some(run_path.display().to_string());
     let body = serde_json::to_vec_pretty(env)?;
     atomic_write(&last_path, &body)?;
     atomic_write(&run_path, &body)?;
@@ -3390,31 +3944,41 @@ fn persist_query_artifacts(root: &Path, env: &mut Envelope) -> Result<()> {
     Ok(())
 }
 
-fn data_vec<T: for<'de> Deserialize<'de>>(data: &Value, key: &str) -> Result<Vec<T>> {
-    let value = data
-        .get(key)
-        .with_context(|| format!("query envelope missing data.{key}"))?;
-    Ok(serde_json::from_value(value.clone())?)
-}
-
 fn query_stdout_envelope(
-    env: &Envelope,
+    env: &QueryEnvelope,
     budget_tokens: Option<usize>,
     compact: bool,
-) -> Result<Envelope> {
-    let mut out = env.clone();
-    let findings = data_vec(&out.data, "findings")?;
-    let visible_findings = pack_findings(findings, budget_tokens);
-    out.data["findings"] = if compact {
-        json!(compact_findings(&visible_findings))
-    } else {
-        json!(visible_findings)
+) -> Result<Envelope<QueryOutputData>> {
+    let data = match &env.data {
+        QueryData::Result(data) => {
+            let findings = pack_findings(data.findings.clone(), budget_tokens);
+            QueryOutputData::Result(QueryResultOutputData {
+                query: data.query.clone(),
+                generation: data.generation.clone(),
+                candidate_files: data.candidate_files.clone(),
+                chunks: data.chunks,
+                chunk_mode: data.chunk_mode.clone(),
+                findings: output_findings(findings, compact),
+                dropped: output_dropped(&data.dropped, compact),
+                weak_signal: data.weak_signal,
+                budget_hit: data.budget_hit.clone(),
+                artifacts: data.artifacts.clone(),
+                refresh: data.refresh.clone(),
+            })
+        }
+        QueryData::Empty(data) => QueryOutputData::Empty(EmptyQueryResultOutputData {
+            query: data.query.clone(),
+            generation: data.generation.clone(),
+            findings: output_findings(pack_findings(data.findings.clone(), budget_tokens), compact),
+            dropped: output_dropped(&data.dropped, compact),
+            candidate_files: data.candidate_files.clone(),
+            weak_signal: data.weak_signal,
+            artifacts: data.artifacts.clone(),
+            refresh: data.refresh.clone(),
+        }),
+        _ => bail!("query envelope missing data.findings"),
     };
-    if compact {
-        let dropped = data_vec(&out.data, "dropped")?;
-        out.data["dropped"] = json!(dropped_reason_counts(&dropped));
-    }
-    Ok(out)
+    Ok(env.clone().with_data(data))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -3445,36 +4009,98 @@ fn prune_query_runs(runs: &Path, keep: usize) -> Result<()> {
     Ok(())
 }
 
-fn insert_data_field(data: &mut Value, key: &str, value: Value) {
-    data.as_object_mut()
-        .expect("envelope data is always an object")
-        .insert(key.into(), value);
-}
-
 #[derive(Debug, Serialize)]
-struct CompactFinding<'a> {
-    file: &'a str,
+struct CompactFinding {
+    file: String,
     line: usize,
-    fact: &'a str,
+    fact: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    quote: Option<&'a str>,
+    quote: Option<String>,
     quote_omitted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    match_tier: Option<&'a str>,
+    match_tier: Option<String>,
 }
 
-fn compact_findings(findings: &[Finding]) -> Vec<CompactFinding<'_>> {
+fn compact_findings(findings: &[Finding]) -> Vec<CompactFinding> {
     findings
         .iter()
         .map(|finding| CompactFinding {
-            file: &finding.file,
+            file: finding.file.clone(),
             line: finding.line,
-            fact: &finding.fact,
-            quote: finding.quote.as_deref(),
+            fact: finding.fact.clone(),
+            quote: finding.quote.clone(),
             quote_omitted: finding.quote_omitted,
-            match_tier: finding.match_tier.as_deref(),
+            match_tier: finding.match_tier.clone(),
         })
         .collect()
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OutputFindings {
+    Full(Vec<Finding>),
+    Compact(Vec<CompactFinding>),
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OutputDropped {
+    Full(Vec<DroppedFinding>),
+    Counts(BTreeMap<String, usize>),
+}
+
+#[derive(Serialize)]
+struct QueryResultOutputData {
+    query: String,
+    generation: String,
+    candidate_files: Vec<String>,
+    chunks: usize,
+    chunk_mode: String,
+    findings: OutputFindings,
+    dropped: OutputDropped,
+    weak_signal: bool,
+    budget_hit: Option<String>,
+    #[serde(flatten)]
+    artifacts: QueryArtifactPaths,
+    #[serde(flatten)]
+    refresh: QueryRefreshData,
+}
+
+#[derive(Serialize)]
+struct EmptyQueryResultOutputData {
+    query: String,
+    generation: String,
+    findings: OutputFindings,
+    dropped: OutputDropped,
+    candidate_files: Vec<String>,
+    weak_signal: bool,
+    #[serde(flatten)]
+    artifacts: QueryArtifactPaths,
+    #[serde(flatten)]
+    refresh: QueryRefreshData,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum QueryOutputData {
+    Result(QueryResultOutputData),
+    Empty(EmptyQueryResultOutputData),
+}
+
+fn output_findings(findings: Vec<Finding>, compact: bool) -> OutputFindings {
+    if compact {
+        OutputFindings::Compact(compact_findings(&findings))
+    } else {
+        OutputFindings::Full(findings)
+    }
+}
+
+fn output_dropped(dropped: &[DroppedFinding], compact: bool) -> OutputDropped {
+    if compact {
+        OutputDropped::Counts(dropped_reason_counts(dropped))
+    } else {
+        OutputDropped::Full(dropped.to_vec())
+    }
 }
 
 fn dropped_reason_counts(dropped: &[DroppedFinding]) -> BTreeMap<String, usize> {
@@ -3756,15 +4382,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-fn truncate_json_value(value: Value, tokens: usize) -> Value {
-    let s = serde_json::to_string(&value).unwrap();
-    if estimate_tokens(&s) <= tokens {
-        value
-    } else {
-        json!({"truncated": true, "preview": truncate_chars(&s, tokens * 4)})
-    }
-}
-
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -3834,7 +4451,7 @@ fn coverage_skips(manifest: &Manifest) -> Vec<Skip> {
     out
 }
 
-fn emit(env: &Envelope, pretty: bool) -> Result<()> {
+fn emit<D: Serialize>(env: &Envelope<D>, pretty: bool) -> Result<()> {
     if pretty {
         println!("{}", serde_json::to_string_pretty(env)?);
     } else {
@@ -3847,12 +4464,24 @@ fn emit(env: &Envelope, pretty: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn empty_query_data(query: impl Into<String>, generation: impl Into<String>) -> QueryData {
+        QueryData::Empty(EmptyQueryResultData {
+            query: query.into(),
+            generation: generation.into(),
+            findings: Vec::new(),
+            dropped: Vec::new(),
+            candidate_files: Vec::new(),
+            weak_signal: false,
+            artifacts: QueryArtifactPaths::default(),
+            refresh: QueryRefreshData::default(),
+        })
+    }
+
     #[test]
     fn cerebras_response_has_typed_content_and_usage() {
-        let response: CerebrasResponse = serde_json::from_value(json!({
-            "choices": [{"message": {"content": "answer"}}],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 3}
-        }))
+        let response: CerebrasResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"answer"}}],"usage":{"prompt_tokens":12,"completion_tokens":3}}"#,
+        )
         .unwrap();
         assert_eq!(response.choices[0].message.content, "answer");
         assert_eq!(response.usage.prompt_tokens, 12);
@@ -3930,6 +4559,13 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_or_original_preserves_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert_eq!(canonicalize_or_original(missing.to_str().unwrap()), missing);
+    }
+
+    #[test]
     fn index_subprocess_accepts_tool_degraded_only() {
         assert!(!index_subprocess_failed(Some(0), "ok"));
         assert!(!index_subprocess_failed(Some(14), "tool_degraded"));
@@ -3939,7 +4575,10 @@ mod tests {
 
     #[test]
     fn index_subprocess_failures_keep_envelope_error_types() {
-        let mut env = Envelope::new("index", "provider_error");
+        let mut env = EnvelopeHeader {
+            state: "provider_error".into(),
+            spend: Spend::default(),
+        };
         let err = index_subprocess_error(Some(13), &env, br#"{"state":"provider_error"}"#).unwrap();
         assert!(is_scout_error(&err, ScoutErrorKind::Provider));
 
@@ -4328,43 +4967,31 @@ mod tests {
 
     #[test]
     fn exact_claim_query_drops_partial_phrase_hits() {
-        let finding = test_finding(
+        assert!(!test_exact_claim_matches(
             "changelog.md",
             7,
             "The changelog says the old compact was a blank check.",
             "PACT Compact: blank check",
-        );
-        assert!(!matches_exact_claim_query(
-            "Where does the corpus say PACT creates a blank-check foreign-aid grant program?",
-            &finding
         ));
     }
 
     #[test]
     fn exact_claim_query_does_not_trust_inflated_fact() {
-        let finding = test_finding(
+        assert!(!test_exact_claim_matches(
             "changelog.md",
             7,
             "PACT creates a blank-check foreign-aid grant program.",
             "PACT Compact: blank check",
-        );
-        assert!(!matches_exact_claim_query(
-            "Where does the corpus say PACT creates a blank-check foreign-aid grant program?",
-            &finding
         ));
     }
 
     #[test]
     fn exact_claim_query_keeps_full_claim_hits() {
-        let finding = test_finding(
+        assert!(test_exact_claim_matches(
             "brief.md",
             9,
             "PACT creates a blank-check foreign-aid grant program.",
             "PACT creates a blank-check foreign-aid grant program",
-        );
-        assert!(matches_exact_claim_query(
-            "Where does the corpus say PACT creates a blank-check foreign-aid grant program?",
-            &finding
         ));
     }
 
@@ -4441,7 +5068,7 @@ mod tests {
         let compact_json = serde_json::to_value(&compact[0]).unwrap();
         assert!(compact_json.get("router_rank").is_none());
         assert!(compact_json.get("deterministic_score").is_none());
-        assert_eq!(compact[0].match_tier, Some("exact"));
+        assert_eq!(compact[0].match_tier.as_deref(), Some("exact"));
         let counts = dropped_reason_counts(&[
             drop_with_reason("quote_not_in_file"),
             drop_with_reason("quote_not_in_file"),
@@ -4472,42 +5099,46 @@ mod tests {
     fn query_artifacts_are_full_atomic_envelopes_and_keep_newest_twenty() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..22 {
-            let mut env = Envelope::for_root("query", "ok", dir.path());
+            let mut env = Envelope::for_root("query", "ok", dir.path())
+                .with_data(empty_query_data(format!("q{i}"), "gen-test"));
             env.spend.usd = i as f64;
             env.timings_ms.insert("total".into(), i);
-            env.data = json!({"query": format!("q{i}"), "generation": "gen-test", "findings": [], "dropped": []});
             persist_query_artifacts(dir.path(), &mut env).unwrap();
         }
-        let last: Envelope = serde_json::from_str(
+        let last: QueryEnvelope = serde_json::from_str(
             &fs::read_to_string(dir.path().join(".scout/last-run.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(last.state, "ok");
-        assert_eq!(last.data["generation"], "gen-test");
-        assert!(last.data.get("run_path").is_some());
+        let QueryData::Empty(last_data) = last.data else {
+            panic!("expected an empty query result");
+        };
+        assert_eq!(last_data.generation, "gen-test");
+        assert!(last_data.artifacts.run_path.is_some());
         let run_count = fs::read_dir(dir.path().join(".scout/runs"))
             .unwrap()
             .filter(|entry| entry.as_ref().unwrap().path().extension().unwrap() == "json")
             .count();
         assert_eq!(run_count, 20);
 
-        let mut env = Envelope::new("query", "ok");
-        env.spend.usd = 1.23;
-        env.data = json!({
-            "query": "q-refresh",
-            "findings": [],
-            "dropped": [],
-            "refreshed_index": {"generation": "gen-refresh", "estimated_usd": 0.01},
+        let mut data = empty_query_data("q-refresh", "gen-test");
+        data.refresh_mut().refreshed_index = Some(RefreshedIndexData {
+            generation: "gen-refresh".into(),
+            estimated_usd: 0.01,
         });
+        let mut env = Envelope::new("query", "ok").with_data(data);
+        env.spend.usd = 1.23;
         persist_query_artifacts(dir.path(), &mut env).unwrap();
-        let persisted: Value = serde_json::from_str(
+        let persisted: QueryEnvelope = serde_json::from_str(
             &fs::read_to_string(dir.path().join(".scout/last-run.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(persisted, serde_json::to_value(&env).unwrap());
-        assert_eq!(persisted["spend"]["usd"], 1.23);
+        assert_eq!(persisted.spend.usd, 1.23);
+        let QueryData::Empty(persisted_data) = persisted.data else {
+            panic!("expected an empty query result");
+        };
         assert_eq!(
-            persisted["data"]["refreshed_index"]["generation"],
+            persisted_data.refresh.refreshed_index.unwrap().generation,
             "gen-refresh"
         );
     }
@@ -4515,71 +5146,90 @@ mod tests {
     #[test]
     fn compact_stdout_does_not_compact_persisted_artifacts() {
         let dir = tempfile::tempdir().unwrap();
-        let mut env = Envelope::new("query", "ok");
-        env.spend.usd = 1.23;
-        env.data = json!({
-            "query": "q-compact",
-            "findings": [{
-                "file": "a.md",
-                "line": 1,
-                "fact": "fact",
-                "quote": "quote",
-                "quote_omitted": false,
-                "router_rank": 2,
-                "deterministic_score": 1.18,
-                "match_tier": "exact",
+        let data = QueryData::Result(QueryResultData {
+            query: "q-compact".into(),
+            generation: "gen-test".into(),
+            candidate_files: vec!["a.md".into()],
+            chunks: 1,
+            chunk_mode: "ranked_boundary".into(),
+            findings: vec![Finding {
+                file: "a.md".into(),
+                line: 1,
+                fact: "fact".into(),
+                quote: Some("quote".into()),
+                quote_omitted: false,
+                router_rank: Some(2),
+                deterministic_score: 1.18,
+                match_tier: Some("exact".into()),
             }],
-            "dropped": [{
-                "file": "a.md",
-                "line": 1,
-                "fact": "bad",
-                "quote": "bad quote",
-                "reason": "quote_not_in_file",
+            dropped: vec![DroppedFinding {
+                file: "a.md".into(),
+                line: Some(1),
+                fact: Some("bad".into()),
+                quote: Some("bad quote".into()),
+                reason: "quote_not_in_file".into(),
             }],
-            "refreshed_index": {"generation": "gen-refresh", "estimated_usd": 0.01},
+            weak_signal: false,
+            budget_hit: None,
+            artifacts: QueryArtifactPaths::default(),
+            refresh: QueryRefreshData {
+                refreshed_index: Some(RefreshedIndexData {
+                    generation: "gen-refresh".into(),
+                    estimated_usd: 0.01,
+                }),
+            },
         });
+        let mut env = Envelope::new("query", "ok").with_data(data);
+        env.spend.usd = 1.23;
         persist_query_artifacts(dir.path(), &mut env).unwrap();
         let stdout_env = query_stdout_envelope(&env, None, true).unwrap();
-        assert!(
-            stdout_env.data["findings"][0]
-                .get("deterministic_score")
-                .is_none()
-        );
-        assert_eq!(stdout_env.data["dropped"]["quote_not_in_file"], 1);
+        let QueryOutputData::Result(stdout_data) = stdout_env.data else {
+            panic!("expected a query result");
+        };
+        let OutputFindings::Compact(compact) = stdout_data.findings else {
+            panic!("expected compact findings");
+        };
+        assert_eq!(compact[0].fact, "fact");
+        let OutputDropped::Counts(counts) = stdout_data.dropped else {
+            panic!("expected dropped counts");
+        };
+        assert_eq!(counts.get("quote_not_in_file"), Some(&1));
 
-        let persisted: Value = serde_json::from_str(
+        let persisted: QueryEnvelope = serde_json::from_str(
             &fs::read_to_string(dir.path().join(".scout/last-run.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(persisted["spend"]["usd"], 1.23);
+        assert_eq!(persisted.spend.usd, 1.23);
+        let QueryData::Result(persisted_data) = persisted.data else {
+            panic!("expected a query result");
+        };
+        assert_eq!(persisted_data.findings[0].deterministic_score, 1.18);
+        assert_eq!(persisted_data.findings[0].router_rank, Some(2));
+        assert_eq!(persisted_data.dropped[0].reason, "quote_not_in_file");
         assert_eq!(
-            persisted["data"]["refreshed_index"]["generation"],
+            persisted_data.refresh.refreshed_index.unwrap().generation,
             "gen-refresh"
         );
-        assert_eq!(
-            persisted["data"]["findings"][0]["deterministic_score"],
-            1.18
-        );
-        assert_eq!(persisted["data"]["findings"][0]["router_rank"], 2);
-        assert_eq!(
-            persisted["data"]["dropped"][0]["reason"],
-            "quote_not_in_file"
-        );
-        let run_path = env.data["run_path"].as_str().unwrap();
-        let persisted_run: Value =
+        let run_path = match &env.data {
+            QueryData::Result(data) => data.artifacts.run_path.as_deref().unwrap(),
+            _ => panic!("expected a query result"),
+        };
+        let persisted_run: QueryEnvelope =
             serde_json::from_str(&fs::read_to_string(run_path).unwrap()).unwrap();
-        assert_eq!(
-            persisted_run["data"]["findings"][0]["deterministic_score"],
-            1.18
-        );
+        let QueryData::Result(persisted_run_data) = persisted_run.data else {
+            panic!("expected a query result");
+        };
+        assert_eq!(persisted_run_data.findings[0].deterministic_score, 1.18);
     }
 
     #[test]
-    fn query_stdout_rejects_invalid_internal_data() {
-        let mut env = Envelope::new("query", "ok");
-        env.data = json!({"findings": "not an array", "dropped": []});
-
-        assert!(query_stdout_envelope(&env, None, true).is_err());
+    fn query_data_rejects_invalid_findings() {
+        assert!(
+            serde_json::from_str::<QueryData>(
+                r#"{"query":"q","generation":"g","findings":"not an array","dropped":[],"candidate_files":[],"weak_signal":false}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4597,91 +5247,67 @@ mod tests {
 
     #[test]
     fn poison_matcher_requires_named_subject_not_neighbor_fact() {
-        let findings = vec![test_finding(
-            "brief.md",
+        assert!(!test_poison_survives(
             5,
             "Current DFC insurance covers only invested capital.",
             "Current DFC insurance covers only invested capital",
-        )];
-        assert!(!poison_survives(
             "The Shield only covers invested capital",
             "What are the six PACT Act instruments?",
-            &findings
         ));
     }
 
     #[test]
     fn poison_matcher_requires_exclusivity_term_for_exclusivity_poison() {
-        let findings = vec![test_finding(
-            "brief.md",
+        assert!(!test_poison_survives(
             8,
             "The Shield covers full economic value at risk, including invested capital.",
             "full economic value at risk, including invested capital",
-        )];
-        assert!(!poison_survives(
             "The Shield only covers invested capital",
             "What are the six PACT Act instruments?",
-            &findings
         ));
     }
 
     #[test]
     fn poison_matcher_catches_actual_exclusivity_poison() {
-        let findings = vec![test_finding(
-            "brief.md",
+        assert!(test_poison_survives(
             8,
             "The Shield only covers invested capital.",
             "The Shield only covers invested capital",
-        )];
-        assert!(poison_survives(
             "The Shield only covers invested capital",
             "What are the six PACT Act instruments?",
-            &findings
         ));
     }
 
     #[test]
     fn poison_matcher_treats_rather_than_as_counterclaim() {
-        let findings = vec![test_finding(
-            "brief.md",
+        assert!(!test_poison_survives(
             35,
             "The PACT Act provides American Investment Shield coverage through the DFC, which covers enterprise value rather than just invested capital.",
             "covers enterprise value, not just invested capital",
-        )];
-        assert!(!poison_survives(
             "The Shield only covers invested capital",
             "What six instruments does the PACT Act build, and what does each do?",
-            &findings
         ));
     }
 
     #[test]
     fn poison_matcher_ignores_query_overlap_without_distinctive_terms() {
-        let findings = vec![test_finding(
-            "brief.md",
+        assert!(!test_poison_survives(
             9,
             "The PACT Act creates six interlocking instruments.",
             "The PACT Act creates six interlocking instruments",
-        )];
-        assert!(!poison_survives(
             "The PACT Act creates a blank-check foreign aid grant program",
             "What are the six PACT Act instruments?",
-            &findings
         ));
     }
 
     #[test]
     fn poison_matcher_catches_actual_distinctive_poison() {
-        let findings = vec![test_finding(
-            "brief.md",
+        assert!(test_poison_survives(
             9,
             "The PACT Act creates a blank-check foreign aid grant program.",
             "blank-check foreign aid grant program",
-        )];
-        assert!(poison_survives(
             "The PACT Act creates a blank-check foreign aid grant program",
             "What are the six PACT Act instruments?",
-            &findings
         ));
     }
 
@@ -4836,9 +5462,14 @@ mod tests {
         };
         let text = truncate_chars(&redact_outbound(&file.text).0, 16_000);
         let prompt = format!("FILE: {}\nADAPTER: {}\n\n{}", file.rel, file.adapter, text);
-        let captured = serde_json::to_string(&json!({
-            "messages": [Message::system("system"), Message::user(prompt)]
-        }))
+        let messages = [Message::system("system"), Message::user(prompt)];
+        let captured = serde_json::to_string(&CerebrasRequest {
+            model: DEFAULT_MODEL,
+            messages: &messages,
+            stream: false,
+            temperature: 0,
+            max_completion_tokens: 900,
+        })
         .unwrap();
         assert!(!captured.contains("trey@example.com"));
         assert!(!captured.contains("sk-1234567890abcdef"));
@@ -4945,11 +5576,11 @@ mod tests {
     fn artifact_setup_failure_is_reported_without_mutating_the_envelope() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".scout"), "not a directory").unwrap();
-        let mut env = Envelope::new("query", "ok");
-        env.data = json!({"findings": [{"fact": "paid result"}]});
-        let before = serde_json::to_value(&env).unwrap();
+        let mut env =
+            Envelope::new("query", "ok").with_data(empty_query_data("paid result", "gen-test"));
+        let before = serde_json::to_string(&env).unwrap();
         assert!(persist_query_artifacts(dir.path(), &mut env).is_err());
-        assert_eq!(serde_json::to_value(&env).unwrap(), before);
+        assert_eq!(serde_json::to_string(&env).unwrap(), before);
     }
 
     #[test]
@@ -5062,6 +5693,27 @@ mod tests {
             deterministic_score: 0.0,
             match_tier: None,
         }
+    }
+
+    fn test_exact_claim_matches(path: &str, line: usize, fact: &str, quote: &str) -> bool {
+        matches_exact_claim_query(
+            "Where does the corpus say PACT creates a blank-check foreign-aid grant program?",
+            &test_finding(path, line, fact, quote),
+        )
+    }
+
+    fn test_poison_survives(
+        line: usize,
+        fact: &str,
+        quote: &str,
+        poison: &str,
+        query: &str,
+    ) -> bool {
+        poison_survives(
+            poison,
+            query,
+            &[test_finding("brief.md", line, fact, quote)],
+        )
     }
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());

@@ -57,15 +57,6 @@ jobs:
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
-      # Each member of the matrix has the following arguments:
-      #
-      # - runner: the github runner
-      # - dist-args: cli flags to pass to dist
-      # - install-dist: expression to run to install dist on the runner
-      #
-      # Typically there will be:
-      # - 1 "global" task that builds universal installers
-      # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
@@ -220,7 +211,7 @@ jobs:
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
+          # Use a file so shell quoting cannot corrupt release notes.
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
