@@ -20,36 +20,6 @@ SKIP_DIRS = {".git", "node_modules", "__pycache__", "target", ".venv", "venv",
 SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".gz", ".tar", ".ico",
             ".woff", ".woff2", ".lock", ".jsonl", ".svg", ".mp4", ".mp3", ".heic"}
 
-STOP = set("the a an and or of to in for on at is are was be with how does do did what "
-           "where when which who why by from it its this that as before after not any "
-           "one all between during into out over under between".split())
-TOP_K = 12  # ponytail: fixed K caps cost by construction; tune/IDF-weight if coverage pays
-
-
-def terms(query):
-    return {_stem(w) for w in re.findall(r"[a-z0-9_]{3,}", query.lower()) if w not in STOP}
-
-
-def _stem(w):
-    for suf in ("ing", "ed", "es", "s"):
-        if w.endswith(suf) and len(w) - len(suf) >= 3:
-            return w[: len(w) - len(suf)]
-    return w
-
-
-def rank(jobs, query):
-    """Top-K chunks by distinct stemmed query terms at word boundaries. Zero model calls."""
-    ts = terms(query)
-    scored = []
-    for j in jobs:
-        low = j[2].lower()
-        hits = {t: len(re.findall(r"\b" + re.escape(t), low)) for t in ts}
-        distinct = sum(1 for n in hits.values() if n)
-        if distinct:
-            scored.append((distinct, sum(hits.values()), j))
-    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
-    return [j for _, _, j in scored[:TOP_K]]
-
 
 SYS = """You are a code-exploration extractor. You get ONE chunk of ONE file (with line \
 numbers) and a query. Return ONLY a JSON array of findings relevant to the query, found \
@@ -129,7 +99,7 @@ def verify(findings, files):
         full = " ".join(nls)
         idx = full.find(q)
         hit = None
-        if idx >= 0:  # map char offset back to the 1-based line where the quote starts
+        if idx >= 0:
             off = 0
             for n, nl in enumerate(nls, 1):
                 if idx < off + len(nl) + 1:
@@ -145,24 +115,17 @@ def verify(findings, files):
     return kept, dropped
 
 
-def scout(query, root, workers=20, prefilter=False):
-    # prefilter defaults OFF: top-K=12 failed its predeclared coverage bar by one fact
-    # (66.7% vs 70) — see docs/experiments/2026-07-05-scout-killtest.md iteration 1b.
-    # K~16-20 or IDF weighting is the untested next lever.
+def scout(query, root, workers=20):
     t0 = time.time()
     files = dict(walk(root))
     jobs = [(rel, ln, body) for rel, text in files.items() for ln, body in chunks(rel, text)]
-    skipped = 0
-    if prefilter:
-        keep = rank(jobs, query)
-        skipped, jobs = len(jobs) - len(keep), keep
     with ThreadPoolExecutor(max_workers=workers) as ex:
         results = list(ex.map(lambda j: extract(query, *j), jobs))
     findings = [f for batch in results for f in batch]
     kept, dropped = verify(findings, files)
     return {
         "query": query, "root": str(root),
-        "files": len(files), "chunks": len(jobs), "chunks_skipped": skipped,
+        "files": len(files), "chunks": len(jobs), "chunks_skipped": 0,
         "findings": kept, "dropped": dropped,
         "wall_s": round(time.time() - t0, 1),
         "spend": dict(gemma.spend),

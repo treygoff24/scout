@@ -170,16 +170,11 @@ fn exit_code_for_state(state: &str) -> i32 {
     STATE_EXIT_CODES
         .iter()
         .find_map(|(s, code)| (*s == state).then_some(*code))
-        .unwrap_or(1)
+        .expect("every envelope state has an exit code")
 }
 
-fn exit_codes_json() -> Value {
-    json!(
-        STATE_EXIT_CODES
-            .iter()
-            .copied()
-            .collect::<BTreeMap<&str, i32>>()
-    )
+fn exit_codes() -> BTreeMap<&'static str, i32> {
+    STATE_EXIT_CODES.iter().copied().collect()
 }
 
 fn state_names() -> Vec<&'static str> {
@@ -308,6 +303,24 @@ struct Usage {
     completion_tokens: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct CerebrasResponse {
+    #[serde(default)]
+    choices: Vec<CerebrasChoice>,
+    #[serde(default)]
+    usage: Usage,
+}
+
+#[derive(Debug, Deserialize)]
+struct CerebrasChoice {
+    message: CerebrasMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct CerebrasMessage {
+    content: String,
+}
+
 #[derive(Clone)]
 struct CerebrasClient {
     api_key: String,
@@ -364,15 +377,14 @@ impl CerebrasClient {
                 .send();
             match response {
                 Ok(resp) if resp.status().is_success() => {
-                    let value: Value = resp.json().context("failed to parse Cerebras JSON")?;
-                    let usage: Usage =
-                        serde_json::from_value(value.get("usage").cloned().unwrap_or_default())
-                            .unwrap_or_default();
-                    self.spend.lock().unwrap().add(usage, retries);
-                    return value
-                        .pointer("/choices/0/message/content")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
+                    let response: CerebrasResponse =
+                        resp.json().context("failed to parse Cerebras JSON")?;
+                    self.spend.lock().unwrap().add(response.usage, retries);
+                    return response
+                        .choices
+                        .into_iter()
+                        .next()
+                        .map(|choice| choice.message.content)
                         .ok_or_else(|| {
                             anyhow!("Cerebras response missing choices[0].message.content")
                         });
@@ -386,25 +398,31 @@ impl CerebrasClient {
                             body.chars().take(500).collect::<String>()
                         );
                     }
-                    retries += 1;
-                    if let Some(gate) = gate {
-                        gate.check_retry_budget(&self.spend)?;
-                    }
-                    sleep_retry(attempt);
+                    self.wait_to_retry(&mut retries, gate, attempt)?;
                 }
                 Err(err) => {
                     if attempt == 5 {
                         return Err(err).context("Cerebras request failed after retries");
                     }
-                    retries += 1;
-                    if let Some(gate) = gate {
-                        gate.check_retry_budget(&self.spend)?;
-                    }
-                    sleep_retry(attempt);
+                    self.wait_to_retry(&mut retries, gate, attempt)?;
                 }
             }
         }
         unreachable!()
+    }
+
+    fn wait_to_retry(
+        &self,
+        retries: &mut u64,
+        gate: Option<&BudgetGate>,
+        attempt: usize,
+    ) -> Result<()> {
+        *retries += 1;
+        if let Some(gate) = gate {
+            gate.check_retry_budget(&self.spend)?;
+        }
+        sleep_retry(attempt);
+        Ok(())
     }
 }
 
@@ -547,12 +565,9 @@ struct Candidate {
 
 #[derive(Debug, Clone)]
 struct Chunk {
-    file: String,
+    candidate: Candidate,
     first_line: usize,
     body: String,
-    router_rank: Option<usize>,
-    deterministic_score: f64,
-    look_for: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -674,8 +689,9 @@ fn print_usage() {
     eprintln!("scout --version | --help");
 }
 
-fn arg_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
-    args.get(index)
+fn next_arg<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&'a str> {
+    *index += 1;
+    args.get(*index)
         .map(String::as_str)
         .ok_or_else(|| usage_error(format!("{flag} needs a value")))
 }
@@ -727,6 +743,18 @@ fn parse_money_arg(value: &str, flag: &str) -> Result<f64> {
         .map_err(|err| usage_error(format!("invalid {flag}: {err}")))
 }
 
+fn next_money_arg(args: &[String], index: &mut usize, flag: &str) -> Result<f64> {
+    parse_money_arg(next_arg(args, index, flag)?, flag)
+}
+
+fn confirm_spend(prompt: &str) -> Result<bool> {
+    eprint!("{prompt}");
+    io::stderr().flush().ok();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("y"))
+}
+
 fn parse_pretty_only(args: &[String], command: &str) -> Result<bool> {
     let mut pretty = false;
     for arg in args {
@@ -737,6 +765,45 @@ fn parse_pretty_only(args: &[String], command: &str) -> Result<bool> {
         }
     }
     Ok(pretty)
+}
+
+#[derive(Debug)]
+struct CorpusArgs {
+    dir: String,
+    budget_tokens: Option<usize>,
+    max_dollars: Option<f64>,
+    pretty: bool,
+    refresh: bool,
+    compact: bool,
+}
+
+fn parse_corpus_args(args: &[String], command: &str) -> Result<CorpusArgs> {
+    let mut parsed = CorpusArgs {
+        dir: ".".into(),
+        budget_tokens: None,
+        max_dollars: None,
+        pretty: false,
+        refresh: false,
+        compact: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--budget" => {
+                parsed.budget_tokens = Some(parse_budget(next_arg(args, &mut i, "--budget")?)?);
+            }
+            "--max-dollars" => {
+                parsed.max_dollars = Some(next_money_arg(args, &mut i, "--max-dollars")?);
+            }
+            "--pretty" => parsed.pretty = true,
+            "--refresh" => parsed.refresh = true,
+            "--compact" if command == "query" => parsed.compact = true,
+            value if !value.starts_with('-') => parsed.dir = value.into(),
+            other => return Err(usage_error(format!("unknown {command} flag {other}"))),
+        }
+        i += 1;
+    }
+    Ok(parsed)
 }
 
 fn cmd_index(args: &[String]) -> Result<i32> {
@@ -752,11 +819,7 @@ fn cmd_index(args: &[String]) -> Result<i32> {
             "--pretty" => pretty = true,
             "--allow-sensitive" => allow_sensitive = true,
             "--max-dollars" => {
-                i += 1;
-                max_dollars = Some(parse_money_arg(
-                    arg_value(args, i, "--max-dollars")?,
-                    "--max-dollars",
-                )?);
+                max_dollars = Some(next_money_arg(args, &mut i, "--max-dollars")?);
             }
             s if !s.starts_with('-') => dir = s.to_string(),
             other => return Err(usage_error(format!("unknown index flag {other}"))),
@@ -774,22 +837,8 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     let markdown_only = env::var("SCOUT_MARKDOWN_ONLY").ok().as_deref() == Some("1");
     let (files, mut skipped) = walk_corpus(&root, false, markdown_only)?;
     let model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    let old = open_snapshot(&root)
-        .ok()
-        .and_then(|s| load_cards(&s).ok().map(|c| (s.manifest, c)));
-    let can_reuse = old
-        .as_ref()
-        .is_some_and(|(m, _)| manifest_compatible(m, &model, &root));
-    let old_by_key: HashMap<(String, String), Card> = old
-        .as_ref()
-        .map(|(_, cards)| {
-            cards
-                .iter()
-                .map(|c| ((c.path.clone(), c.hash.clone()), c.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let estimate_files: Vec<WalkedFile> = files_to_card(&files, can_reuse, &old_by_key)
+    let old_by_key = reusable_cards_by_key(&root, &model);
+    let estimate_files: Vec<WalkedFile> = files_to_card(&files, &old_by_key)
         .into_iter()
         .cloned()
         .collect();
@@ -808,17 +857,15 @@ fn cmd_index(args: &[String]) -> Result<i32> {
         env.data = json!({"estimated_usd": estimate, "max_dollars": cap});
         return finish_env(&env, pretty);
     }
-    if !yes && estimate > 0.0 && io::stdin().is_terminal() {
-        eprint!("Proceed with index spend? [y/N] ");
-        io::stderr().flush().ok();
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        if !line.trim().eq_ignore_ascii_case("y") {
-            let mut env = Envelope::new("index", "budget_hit");
-            env.root = Some(root.display().to_string());
-            env.data = json!({"cancelled": true, "estimated_usd": estimate});
-            return finish_env(&env, pretty);
-        }
+    if !yes
+        && estimate > 0.0
+        && io::stdin().is_terminal()
+        && !confirm_spend("Proceed with index spend? [y/N] ")?
+    {
+        let mut env = Envelope::new("index", "budget_hit");
+        env.root = Some(root.display().to_string());
+        env.data = json!({"cancelled": true, "estimated_usd": estimate});
+        return finish_env(&env, pretty);
     }
 
     let spend = Arc::new(Mutex::new(Spend::default()));
@@ -838,8 +885,7 @@ fn cmd_index(args: &[String]) -> Result<i32> {
             continue;
         }
         let skeleton = skeletonize(&file, *churn.get(&file.rel).unwrap_or(&0));
-        if can_reuse && let Some(old_card) = old_by_key.get(&(file.rel.clone(), file.hash.clone()))
-        {
+        if let Some(old_card) = old_by_key.get(&(file.rel.clone(), file.hash.clone())) {
             cards.push(Card {
                 role: ModelHint {
                     model_hint: true,
@@ -1058,6 +1104,18 @@ struct RefreshResult {
     generation: String,
 }
 
+fn merge_refresh_result(env: &mut Envelope, result: Option<&RefreshResult>) {
+    let Some(result) = result else {
+        return;
+    };
+    env.spend.merge(&result.spend);
+    insert_data_field(
+        &mut env.data,
+        "refreshed_index",
+        json!({"estimated_usd": result.estimated_usd, "generation": result.generation}),
+    );
+}
+
 enum RefreshDecision {
     NotNeeded,
     Refreshed(RefreshResult),
@@ -1123,59 +1181,29 @@ fn refresh_index_if_needed(
 
 fn cmd_query(args: &[String]) -> Result<i32> {
     let query = args[0].clone();
-    let mut dir = ".".to_string();
-    let mut budget_tokens = None;
-    let mut max_dollars = None;
-    let mut pretty = false;
-    let mut refresh = false;
-    let mut compact = false;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--budget" => {
-                i += 1;
-                budget_tokens = Some(parse_budget(arg_value(args, i, "--budget")?)?);
-            }
-            "--max-dollars" => {
-                i += 1;
-                max_dollars = Some(parse_money_arg(
-                    arg_value(args, i, "--max-dollars")?,
-                    "--max-dollars",
-                )?);
-            }
-            "--pretty" => pretty = true,
-            "--refresh" => refresh = true,
-            "--compact" => compact = true,
-            s if !s.starts_with('-') => dir = s.to_string(),
-            s => return Err(usage_error(format!("unknown query flag {s}"))),
-        }
-        i += 1;
-    }
-    let root = fs::canonicalize(&dir).unwrap_or_else(|_| PathBuf::from(dir));
-    let refresh_result = if refresh {
-        match refresh_index_if_needed("query", &root, max_dollars, false)? {
+    let options = parse_corpus_args(&args[1..], "query")?;
+    let root = fs::canonicalize(&options.dir).unwrap_or_else(|_| PathBuf::from(&options.dir));
+    let refresh_result = if options.refresh {
+        match refresh_index_if_needed("query", &root, options.max_dollars, false)? {
             RefreshDecision::NotNeeded => None,
             RefreshDecision::Refreshed(result) => Some(result),
-            RefreshDecision::Refused(env) => return finish_env(&env, pretty),
+            RefreshDecision::Refused(env) => return finish_env(&env, options.pretty),
         }
     } else {
         None
     };
-    let query_max_dollars =
-        max_dollars.map(|cap| cap - refresh_result.as_ref().map(|r| r.spend.usd).unwrap_or(0.0));
+    let query_max_dollars = options
+        .max_dollars
+        .map(|cap| cap - refresh_result.as_ref().map(|r| r.spend.usd).unwrap_or(0.0));
     match query_once(&query, &root, query_max_dollars) {
         Ok((env, code)) => {
             let mut env = env;
-            if let Some(result) = refresh_result {
-                env.spend.merge(&result.spend);
-                insert_data_field(
-                    &mut env.data,
-                    "refreshed_index",
-                    json!({"estimated_usd": result.estimated_usd, "generation": result.generation}),
-                );
-            }
+            merge_refresh_result(&mut env, refresh_result.as_ref());
             persist_query_artifacts(&root, &mut env)?;
-            let emitted = finish_env(&query_stdout_envelope(&env, budget_tokens, compact), pretty)?;
+            let emitted = finish_env(
+                &query_stdout_envelope(&env, options.budget_tokens, options.compact),
+                options.pretty,
+            )?;
             debug_assert_eq!(emitted, code);
             Ok(emitted)
         }
@@ -1183,7 +1211,7 @@ fn cmd_query(args: &[String]) -> Result<i32> {
             let mut env = Envelope::new("query", "index_missing");
             env.root = Some(root.display().to_string());
             env.errors.push("index_missing; run scout index".into());
-            finish_env(&env, pretty)
+            finish_env(&env, options.pretty)
         }
         Err(err) => Err(err),
     }
@@ -1193,12 +1221,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
     let total_start = Instant::now();
     let snapshot = open_snapshot(root).map_err(|_| anyhow!("index_missing"))?;
     let cards = load_cards(&snapshot)?;
-    let stale =
-        staleness_report(root, &snapshot.manifest, &cards).unwrap_or_else(|_| StalenessReport {
-            stale: true,
-            reason: "content_hash_mismatch".into(),
-            changed_files: 0,
-        });
+    let stale = conservative_staleness_report(root, &snapshot.manifest, &cards);
     if stale.stale {
         let mut env = Envelope::new("query", "index_stale");
         env.root = Some(root.display().to_string());
@@ -1346,6 +1369,16 @@ fn query_state(
     if findings == 0 { "unanswered" } else { "ok" }
 }
 
+fn drop_chunk(chunk: &Chunk, reason: impl Into<String>, quote: Option<String>) -> DroppedFinding {
+    DroppedFinding {
+        file: chunk.candidate.path.clone(),
+        line: Some(chunk.first_line),
+        fact: None,
+        quote,
+        reason: reason.into(),
+    }
+}
+
 fn extract_chunk(
     client: &CerebrasClient,
     gate: &BudgetGate,
@@ -1355,19 +1388,13 @@ fn extract_chunk(
     let projected =
         estimate_tokens(&chunk.body) as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK + 0.006;
     if !gate.may_launch(&client.spend, projected) {
-        return Err(DroppedFinding {
-            file: chunk.file.clone(),
-            line: Some(chunk.first_line),
-            fact: None,
-            quote: None,
-            reason: "budget_hit_before_chunk".into(),
-        });
+        return Err(drop_chunk(chunk, "budget_hit_before_chunk", None));
     }
     let (redacted, redactions) = redact_outbound(&chunk.body);
-    let guidance = chunk.look_for.clone().unwrap_or_default();
+    let guidance = chunk.candidate.look_for.clone().unwrap_or_default();
     let user = format!(
         "FILE: {} (chunk starting at line {})\nLOOK_FOR: {}\nREDACTIONS_APPLIED: {}\n\n{}\n\nQUERY: {}",
-        chunk.file, chunk.first_line, guidance, redactions, redacted, query
+        chunk.candidate.path, chunk.first_line, guidance, redactions, redacted, query
     );
     let raw = client
         .chat_with_budget(
@@ -1375,35 +1402,32 @@ fn extract_chunk(
             2000,
             Some(gate),
         )
-        .map_err(|err| DroppedFinding {
-            file: chunk.file.clone(),
-            line: Some(chunk.first_line),
-            fact: None,
-            quote: None,
-            reason: if err.downcast_ref::<BudgetHitError>().is_some() {
+        .map_err(|err| {
+            let reason = if err.downcast_ref::<BudgetHitError>().is_some() {
                 "budget_hit_before_retry".into()
             } else {
                 format!("provider_error: {err:#}")
-            },
+            };
+            drop_chunk(chunk, reason, None)
         })?;
-    let arr: Vec<RawFinding> = parse_jsonish(&raw).map_err(|err| DroppedFinding {
-        file: chunk.file.clone(),
-        line: Some(chunk.first_line),
-        fact: None,
-        quote: Some(raw.chars().take(500).collect()),
-        reason: format!("unparseable: {err}"),
+    let arr: Vec<RawFinding> = parse_jsonish(&raw).map_err(|err| {
+        drop_chunk(
+            chunk,
+            format!("unparseable: {err}"),
+            Some(raw.chars().take(500).collect()),
+        )
     })?;
     Ok(arr
         .into_iter()
         .filter_map(|f| {
             Some(Finding {
-                file: chunk.file.clone(),
+                file: chunk.candidate.path.clone(),
                 line: f.line?,
                 fact: f.fact?,
                 quote: f.quote,
                 quote_omitted: false,
-                router_rank: chunk.router_rank,
-                deterministic_score: chunk.deterministic_score,
+                router_rank: chunk.candidate.router_rank,
+                deterministic_score: chunk.candidate.deterministic_score,
                 match_tier: None,
             })
         })
@@ -1418,39 +1442,34 @@ Rules:
 - If nothing in this chunk is relevant, return []. That is correct for most chunks. Never invent a finding.
 Return JSON only, no prose or markdown fence."#;
 
+#[derive(Serialize)]
+struct BriefModuleEntry<'a> {
+    path: &'a str,
+    role: &'a ModelHint<String>,
+    symbols: &'a [Symbol],
+    outline: &'a [OutlineItem],
+    loc: usize,
+    churn: u32,
+    harness_meta: bool,
+}
+
+#[derive(Serialize)]
+struct BriefEntryPoint<'a> {
+    path: &'a str,
+    role: &'a ModelHint<String>,
+    imports: usize,
+    churn: u32,
+    harness_meta: bool,
+}
+
 fn cmd_brief(args: &[String]) -> Result<i32> {
-    let mut dir = ".".to_string();
-    let mut budget_tokens = None;
-    let mut max_dollars = None;
-    let mut pretty = false;
-    let mut refresh = false;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--budget" => {
-                i += 1;
-                budget_tokens = Some(parse_budget(arg_value(args, i, "--budget")?)?);
-            }
-            "--max-dollars" => {
-                i += 1;
-                max_dollars = Some(parse_money_arg(
-                    arg_value(args, i, "--max-dollars")?,
-                    "--max-dollars",
-                )?);
-            }
-            "--pretty" => pretty = true,
-            "--refresh" => refresh = true,
-            s if !s.starts_with('-') => dir = s.to_string(),
-            other => return Err(usage_error(format!("unknown brief flag {other}"))),
-        }
-        i += 1;
-    }
-    let root = fs::canonicalize(&dir).unwrap_or_else(|_| PathBuf::from(dir));
-    let refresh_result = if refresh {
-        match refresh_index_if_needed("brief", &root, max_dollars, false)? {
+    let options = parse_corpus_args(args, "brief")?;
+    let root = fs::canonicalize(&options.dir).unwrap_or_else(|_| PathBuf::from(&options.dir));
+    let refresh_result = if options.refresh {
+        match refresh_index_if_needed("brief", &root, options.max_dollars, false)? {
             RefreshDecision::NotNeeded => None,
             RefreshDecision::Refreshed(result) => Some(result),
-            RefreshDecision::Refused(env) => return finish_env(&env, pretty),
+            RefreshDecision::Refused(env) => return finish_env(&env, options.pretty),
         }
     } else {
         None
@@ -1461,48 +1480,54 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
             let mut env = Envelope::new("brief", "index_missing");
             env.root = Some(root.display().to_string());
             env.data = json!({"hint": "run scout index"});
-            return finish_env(&env, pretty);
+            return finish_env(&env, options.pretty);
         }
     };
     let mut cards = load_cards(&snapshot)?;
     cards.sort_by(|a, b| a.path.cmp(&b.path));
-    let stale =
-        staleness_report(&root, &snapshot.manifest, &cards).unwrap_or_else(|_| StalenessReport {
-            stale: true,
-            reason: "content_hash_mismatch".into(),
-            changed_files: 0,
-        });
-    let mut dirs: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let stale = conservative_staleness_report(&root, &snapshot.manifest, &cards);
+    let mut dirs: BTreeMap<String, Vec<BriefModuleEntry<'_>>> = BTreeMap::new();
     for c in &cards {
         let dir = Path::new(&c.path)
             .parent()
             .map(|p| p.display().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| ".".into());
-        dirs.entry(dir).or_default().push(json!({
-            "path": c.path,
-            "role": c.role,
-            "symbols": c.symbols.iter().take(8).collect::<Vec<_>>(),
-            "outline": c.outline.iter().take(8).collect::<Vec<_>>(),
-            "loc": c.loc,
-            "churn": c.churn,
-            "harness_meta": c.harness_meta,
-        }));
+        dirs.entry(dir).or_default().push(BriefModuleEntry {
+            path: &c.path,
+            role: &c.role,
+            symbols: &c.symbols[..c.symbols.len().min(8)],
+            outline: &c.outline[..c.outline.len().min(8)],
+            loc: c.loc,
+            churn: c.churn,
+            harness_meta: c.harness_meta,
+        });
     }
-    let entry_points = brief_entry_points(&cards);
+    let ranked_entry_points = brief_entry_points(&cards);
+    let entry_points: Vec<_> = ranked_entry_points
+        .iter()
+        .take(20)
+        .map(|c| BriefEntryPoint {
+            path: &c.path,
+            role: &c.role,
+            imports: c.imports.len(),
+            churn: c.churn,
+            harness_meta: c.harness_meta,
+        })
+        .collect();
     let unsupported = coverage_skips(&snapshot.manifest);
     let stale_reason = stale.stale.then(|| stale.reason.clone());
     let data = json!({
         "generation": snapshot.gen_dir.file_name().unwrap().to_string_lossy(),
         "module_map": dirs,
-        "entry_points": entry_points.into_iter().take(20).map(|c| json!({"path": c.path, "role": c.role, "imports": c.imports.len(), "churn": c.churn, "harness_meta": c.harness_meta})).collect::<Vec<_>>(),
+        "entry_points": entry_points,
         "unsupported": unsupported,
         "coverage_note": coverage_note(&unsupported),
         "stale": stale.stale,
         "stale_reason": stale_reason,
         "changed_files": stale.changed_files,
     });
-    let packed = if let Some(tokens) = budget_tokens {
+    let packed = if let Some(tokens) = options.budget_tokens {
         truncate_json_value(data, tokens)
     } else {
         data
@@ -1511,15 +1536,8 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
     env.root = Some(root.display().to_string());
     env.skipped = snapshot.manifest.skipped.clone();
     env.data = packed;
-    if let Some(result) = refresh_result {
-        env.spend.merge(&result.spend);
-        insert_data_field(
-            &mut env.data,
-            "refreshed_index",
-            json!({"estimated_usd": result.estimated_usd, "generation": result.generation}),
-        );
-    }
-    finish_env(&env, pretty)
+    merge_refresh_result(&mut env, refresh_result.as_ref());
+    finish_env(&env, options.pretty)
 }
 
 fn brief_entry_points(cards: &[Card]) -> Vec<Card> {
@@ -1547,7 +1565,7 @@ fn cmd_capabilities(args: &[String]) -> Result<i32> {
         "redaction": ["known token formats", "bearer tokens", "key/value secrets", "JWT", "high-entropy strings", "emails", "home paths"],
         "adapters": {"code": "regex skeleton; ctags optional doctor signal", "markdown": "headings/links", "pdf": "pdftotext if installed", "docx": "pandoc if installed"},
         "states": state_names(),
-        "exit_codes": exit_codes_json(),
+        "exit_codes": exit_codes(),
         "flags": {
             "query": ["--budget", "--max-dollars", "--refresh", "--compact", "--pretty", "--query"],
             "brief": ["--budget", "--max-dollars", "--refresh", "--pretty"],
@@ -1563,7 +1581,7 @@ fn cmd_schema(args: &[String]) -> Result<i32> {
     let mut env = Envelope::new("schema", "ok");
     env.data = json!({
         "envelope": {"schema": SCHEMA, "state": state_names().join("|"), "data": "command-specific"},
-        "exit_codes": exit_codes_json(),
+        "exit_codes": exit_codes(),
         "card_schema_version": CARD_SCHEMA_VERSION,
         "finding": {"file": "relative path", "line": "1-based source line", "fact": "model text supported by quote", "quote": "verbatim unless omitted", "quote_omitted": "true when budget packed", "match_tier": "exact|markdown_normalized", "deterministic_score": "omitted only with --compact", "router_rank": "omitted only with --compact"},
         "query_data": {"weak_signal": "true when max finding deterministic_score is below 40% of the top candidate deterministic score", "dropped": "array, or {reason: count} with --compact", "changed_files": "present on index_stale"},
@@ -1610,19 +1628,13 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
     while i < args.len() {
         match args[i].as_str() {
             "--max-dollars" => {
-                i += 1;
-                max_dollars = Some(parse_money_arg(
-                    arg_value(args, i, "--max-dollars")?,
-                    "--max-dollars",
-                )?);
+                max_dollars = Some(next_money_arg(args, &mut i, "--max-dollars")?);
             }
             "--only" => {
-                i += 1;
-                only = Some(arg_value(args, i, "--only")?.to_string());
+                only = Some(next_arg(args, &mut i, "--only")?.to_string());
             }
             "--corpus" => {
-                i += 1;
-                corpus_override = Some(arg_value(args, i, "--corpus")?.to_string());
+                corpus_override = Some(next_arg(args, &mut i, "--corpus")?.to_string());
             }
             "--yes" | "-y" => yes = true,
             "--pretty" => pretty = true,
@@ -1662,18 +1674,13 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
         max_dollars,
         estimate
     );
-    if !yes && io::stdin().is_terminal() {
-        eprint!("Proceed with live eval spend? [y/N] ");
-        io::stderr().flush().ok();
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        if !line.trim().eq_ignore_ascii_case("y") {
-            bail!("eval cancelled before spend");
-        }
+    if !yes && io::stdin().is_terminal() && !confirm_spend("Proceed with live eval spend? [y/N] ")?
+    {
+        bail!("eval cancelled before spend");
     }
     let mut total_spend = Spend::default();
     let mut results = Vec::new();
-    let cap = max_dollars.unwrap_or(8.0);
+    let cap = max_dollars.unwrap();
     let eval_dir = PathBuf::from(".scout")
         .join("eval-runs")
         .join(format!("{milestone}-{}", unix_ms()));
@@ -1728,45 +1735,28 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
             .filter(|p| poison_survives(&p.fact, &q.query, &findings))
             .count();
         let artifact_path = write_eval_artifact(&eval_dir, q, &env)?;
-        results.push(json!({
-            "id": q.id,
-            "state": env.state,
-            "must_files_present": must_files,
-            "must_files_total": q.must_find.len(),
-            "coverage": covered,
-            "coverage_total": q.must_find.len(),
-            "poison_survivors": poison_survivors,
-            "negative_clean": q.negative.unwrap_or(false) && findings.is_empty(),
-            "spend_usd": env.spend.usd,
-            "candidate_files": candidate_files,
-            "artifact_path": artifact_path,
-        }));
+        results.push(EvalResult {
+            id: q.id.clone(),
+            state: env.state.clone(),
+            must_files_present: must_files,
+            must_files_total: q.must_find.len(),
+            coverage: covered,
+            coverage_total: q.must_find.len(),
+            poison_survivors,
+            negative_clean: q.negative.unwrap_or(false) && findings.is_empty(),
+            spend_usd: env.spend.usd,
+            candidate_files,
+            artifact_path,
+        });
         if total_spend.usd >= cap {
             break;
         }
     }
     let must_total: usize = queries.iter().map(|q| q.must_find.len()).sum();
-    let covered_total: usize = results
-        .iter()
-        .map(|r| r.get("coverage").and_then(Value::as_u64).unwrap_or(0) as usize)
-        .sum();
+    let covered_total: usize = results.iter().map(|result| result.coverage).sum();
     let file_total: usize = queries.iter().map(|q| q.must_find.len()).sum();
-    let file_present: usize = results
-        .iter()
-        .map(|r| {
-            r.get("must_files_present")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize
-        })
-        .sum();
-    let poison_total: usize = results
-        .iter()
-        .map(|r| {
-            r.get("poison_survivors")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize
-        })
-        .sum();
+    let file_present: usize = results.iter().map(|result| result.must_files_present).sum();
+    let poison_total: usize = results.iter().map(|result| result.poison_survivors).sum();
     let avg_query = if results.is_empty() {
         0.0
     } else {
@@ -1777,13 +1767,9 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
         .filter(|q| q.negative.unwrap_or(false))
         .map(|q| q.id.as_str())
         .collect();
-    let negatives_clean = results.iter().all(|r| {
-        let id = r.get("id").and_then(Value::as_str).unwrap_or("");
-        !negative_ids.contains(id)
-            || r.get("negative_clean")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-    });
+    let negatives_clean = results
+        .iter()
+        .all(|result| !negative_ids.contains(result.id.as_str()) || result.negative_clean);
     let suite_complete = results.len() == queries.len();
     let coverage_pass = must_total == 0 || covered_total as f64 / must_total as f64 >= 0.714;
     let candidate_file_recall_pass = file_total == file_present;
@@ -1795,38 +1781,38 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
         && poison_pass
         && negatives_clean
         && cost_pass;
-    let metrics = json!({
-        "candidate_file_recall": pct(file_present, file_total),
-        "coverage": pct(covered_total, must_total),
-        "poison_survivors": poison_total,
-        "negatives_clean": negatives_clean,
-        "suite_complete": suite_complete,
-        "avg_usd_per_query": avg_query,
-    });
-    let gate_results = json!({
-        "candidate_file_recall": candidate_file_recall_pass,
-        "coverage": coverage_pass,
-        "poison_survivors": poison_pass,
-        "negatives_clean": negatives_clean,
-        "suite_complete": suite_complete,
-        "avg_usd_per_query": cost_pass,
-    });
+    let metrics = EvalMetrics {
+        candidate_file_recall: pct(file_present, file_total),
+        coverage: pct(covered_total, must_total),
+        poison_survivors: poison_total,
+        negatives_clean,
+        suite_complete,
+        avg_usd_per_query: avg_query,
+    };
+    let gate_results = EvalGateResults {
+        candidate_file_recall: candidate_file_recall_pass,
+        coverage: coverage_pass,
+        poison_survivors: poison_pass,
+        negatives_clean,
+        suite_complete,
+        avg_usd_per_query: cost_pass,
+    };
     let summary_path = eval_dir.join("summary.json");
     atomic_write(
         &summary_path,
         &serde_json::to_vec_pretty(&json!({
             "milestone": milestone,
-            "metrics": metrics.clone(),
-            "gate_results": gate_results.clone(),
-            "total_spend": total_spend.clone(),
-            "per_query_artifacts": results.iter().map(|r| json!({
-                "id": r.get("id"),
-                "state": r.get("state"),
-                "artifact_path": r.get("artifact_path"),
-                "candidate_file_recall_pass": r.get("must_files_present") == r.get("must_files_total"),
-                "coverage_pass": r.get("coverage") == r.get("coverage_total"),
-                "poison_pass": r.get("poison_survivors").and_then(Value::as_u64).unwrap_or(0) == 0,
-                "negative_clean": r.get("negative_clean"),
+            "metrics": metrics,
+            "gate_results": gate_results,
+            "total_spend": total_spend,
+            "per_query_artifacts": results.iter().map(|result| json!({
+                "id": result.id,
+                "state": result.state,
+                "artifact_path": result.artifact_path,
+                "candidate_file_recall_pass": result.must_files_present == result.must_files_total,
+                "coverage_pass": result.coverage == result.coverage_total,
+                "poison_pass": result.poison_survivors == 0,
+                "negative_clean": result.negative_clean,
             })).collect::<Vec<_>>(),
         }))?,
     )?;
@@ -1921,6 +1907,41 @@ struct GoldenPoison {
     fact: String,
 }
 
+#[derive(Debug, Serialize)]
+struct EvalResult {
+    id: String,
+    state: String,
+    must_files_present: usize,
+    must_files_total: usize,
+    coverage: usize,
+    coverage_total: usize,
+    poison_survivors: usize,
+    negative_clean: bool,
+    spend_usd: f64,
+    candidate_files: Vec<String>,
+    artifact_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalMetrics {
+    candidate_file_recall: f64,
+    coverage: f64,
+    poison_survivors: usize,
+    negatives_clean: bool,
+    suite_complete: bool,
+    avg_usd_per_query: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalGateResults {
+    candidate_file_recall: bool,
+    coverage: bool,
+    poison_survivors: bool,
+    negatives_clean: bool,
+    suite_complete: bool,
+    avg_usd_per_query: bool,
+}
+
 fn load_eval_suite(path: &Path) -> Result<EvalSuite> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
@@ -1931,7 +1952,7 @@ fn write_eval_artifact(dir: &Path, query: &EvalQuery, env: &Envelope) -> Result<
         .get("last_run_path")
         .and_then(Value::as_str)
         .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        .and_then(|text| serde_json::from_str::<Envelope>(&text).ok());
     let path = dir.join(format!("{}.json", query.id));
     fs::write(
         &path,
@@ -2390,7 +2411,7 @@ fn is_sensitive_path(rel: &Path, _is_dir: bool) -> bool {
 
 fn rel_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
-        .unwrap_or(path)
+        .expect("walked paths are rooted in the corpus")
         .components()
         .filter_map(|c| match c {
             Component::Normal(s) => Some(s.to_string_lossy().to_string()),
@@ -2449,11 +2470,7 @@ fn symbols(text: &str, adapter: &str) -> Vec<Symbol> {
         .filter_map(|(i, line)| {
             re.captures(line).map(|c| Symbol {
                 name: c.get(1).unwrap().as_str().to_string(),
-                kind: line
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("symbol")
-                    .to_string(),
+                kind: line.split_whitespace().next().unwrap().to_string(),
                 line: i + 1,
             })
         })
@@ -2782,13 +2799,16 @@ fn file_meta(root: &Path, rel: &str) -> Option<ManifestFileMeta> {
     let meta = fs::metadata(root.join(rel)).ok()?;
     Some(ManifestFileMeta {
         size: meta.len(),
-        mtime_unix_ms: meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis())
-            .unwrap_or_default(),
+        mtime_unix_ms: modified_unix_ms(&meta),
     })
+}
+
+fn modified_unix_ms(meta: &fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 fn walk_corpus_file_meta(
@@ -2827,12 +2847,7 @@ fn walk_corpus_file_meta(
             rel,
             ManifestFileMeta {
                 size: meta.len(),
-                mtime_unix_ms: meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis())
-                    .unwrap_or_default(),
+                mtime_unix_ms: modified_unix_ms(&meta),
             },
         );
     }
@@ -2844,6 +2859,18 @@ struct StalenessReport {
     stale: bool,
     reason: String,
     changed_files: usize,
+}
+
+fn conservative_staleness_report(
+    root: &Path,
+    manifest: &Manifest,
+    cards: &[Card],
+) -> StalenessReport {
+    staleness_report(root, manifest, cards).unwrap_or_else(|_| StalenessReport {
+        stale: true,
+        reason: "content_hash_mismatch".into(),
+        changed_files: 0,
+    })
 }
 
 fn staleness_report(root: &Path, manifest: &Manifest, cards: &[Card]) -> Result<StalenessReport> {
@@ -2893,11 +2920,11 @@ fn changed_files_since_cards(root: &Path, manifest: &Manifest, cards: &[Card]) -
 }
 
 fn manifest_current(m: &Manifest, root: &Path) -> bool {
-    m.schema_version == CARD_SCHEMA_VERSION
-        && m.card_prompt_hash == sha256(CARD_PROMPT.as_bytes())
-        && m.model == env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
-        && m.adapter_version == adapter_version()
-        && m.ignore_config_hash == ignore_config_hash(root)
+    manifest_compatible(
+        m,
+        &env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
+        root,
+    )
 }
 
 fn manifest_compatible(m: &Manifest, model: &str, root: &Path) -> bool {
@@ -3032,7 +3059,7 @@ fn deterministic_candidates(
         let mut score = 0.0;
         for t in &qterms {
             if set.contains(t) {
-                score += 1.0 / (*df.get(t).unwrap_or(&1) as f64);
+                score += 1.0 / (df[t] as f64);
             }
         }
         if c.path
@@ -3052,12 +3079,23 @@ fn deterministic_candidates(
     }
     scored.sort_by(|a, b| {
         b.deterministic_score
-            .partial_cmp(&a.deterministic_score)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&a.deterministic_score)
             .then_with(|| a.path.cmp(&b.path))
     });
     scored.truncate(limit);
     scored
+}
+
+fn router_rank_score_order(
+    a_rank: Option<usize>,
+    a_score: f64,
+    b_rank: Option<usize>,
+    b_score: f64,
+) -> Ordering {
+    a_rank
+        .unwrap_or(usize::MAX)
+        .cmp(&b_rank.unwrap_or(usize::MAX))
+        .then_with(|| b_score.total_cmp(&a_score))
 }
 
 fn final_candidates(
@@ -3084,15 +3122,13 @@ fn final_candidates(
     }
     let mut out: Vec<Candidate> = by_path.into_values().collect();
     out.sort_by(|a, b| {
-        a.router_rank
-            .unwrap_or(usize::MAX)
-            .cmp(&b.router_rank.unwrap_or(usize::MAX))
-            .then_with(|| {
-                b.deterministic_score
-                    .partial_cmp(&a.deterministic_score)
-                    .unwrap_or(Ordering::Equal)
-            })
-            .then_with(|| a.path.cmp(&b.path))
+        router_rank_score_order(
+            a.router_rank,
+            a.deterministic_score,
+            b.router_rank,
+            b.deterministic_score,
+        )
+        .then_with(|| a.path.cmp(&b.path))
     });
     out
 }
@@ -3120,12 +3156,9 @@ fn build_chunks(
         if let Some(text) = files.get(&c.path) {
             for (first_line, body) in chunks_for(&c.path, text, chunk_mode) {
                 chunks.push(Chunk {
-                    file: c.path.clone(),
+                    candidate: c.clone(),
                     first_line,
                     body,
-                    router_rank: c.router_rank,
-                    deterministic_score: c.deterministic_score,
-                    look_for: c.look_for.clone(),
                 });
             }
         }
@@ -3153,7 +3186,7 @@ fn rank_chunks(mut chunks: Vec<Chunk>, query: &str, cap: usize) -> Vec<Chunk> {
     for chunk in &chunks {
         let score = chunk_score(chunk, &qterms);
         best_by_file
-            .entry(chunk.file.clone())
+            .entry(chunk.candidate.path.clone())
             .and_modify(|(old_score, old)| {
                 if score > *old_score {
                     *old_score = score;
@@ -3164,53 +3197,50 @@ fn rank_chunks(mut chunks: Vec<Chunk>, query: &str, cap: usize) -> Vec<Chunk> {
     }
     chunks.sort_by(|a, b| {
         chunk_score(b, &qterms)
-            .partial_cmp(&chunk_score(a, &qterms))
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.file.cmp(&b.file))
+            .total_cmp(&chunk_score(a, &qterms))
+            .then_with(|| a.candidate.path.cmp(&b.candidate.path))
             .then_with(|| a.first_line.cmp(&b.first_line))
     });
     let mut best = best_by_file.into_values().collect::<Vec<_>>();
-    best.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    best.sort_by(|a, b| b.0.total_cmp(&a.0));
     best.truncate(cap);
     let mut out = best.into_iter().map(|(_, chunk)| chunk).collect::<Vec<_>>();
     let mut seen: HashSet<(String, usize)> = out
         .iter()
-        .map(|chunk| (chunk.file.clone(), chunk.first_line))
+        .map(|chunk| (chunk.candidate.path.clone(), chunk.first_line))
         .collect();
     for chunk in chunks {
         if out.len() >= cap {
             break;
         }
-        if seen.insert((chunk.file.clone(), chunk.first_line)) {
+        if seen.insert((chunk.candidate.path.clone(), chunk.first_line)) {
             out.push(chunk);
         }
     }
     out.sort_by(|a, b| {
-        a.router_rank
-            .unwrap_or(usize::MAX)
-            .cmp(&b.router_rank.unwrap_or(usize::MAX))
-            .then_with(|| {
-                b.deterministic_score
-                    .partial_cmp(&a.deterministic_score)
-                    .unwrap_or(Ordering::Equal)
-            })
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.first_line.cmp(&b.first_line))
+        router_rank_score_order(
+            a.candidate.router_rank,
+            a.candidate.deterministic_score,
+            b.candidate.router_rank,
+            b.candidate.deterministic_score,
+        )
+        .then_with(|| a.candidate.path.cmp(&b.candidate.path))
+        .then_with(|| a.first_line.cmp(&b.first_line))
     });
     out
 }
 
 fn chunk_score(chunk: &Chunk, qterms: &[String]) -> f64 {
     let low = chunk.body.to_ascii_lowercase();
-    let look_terms = terms(chunk.look_for.as_deref().unwrap_or(""));
-    let mut score = chunk.deterministic_score;
+    let look_terms = terms(chunk.candidate.look_for.as_deref().unwrap_or(""));
+    let mut score = chunk.candidate.deterministic_score;
     for term in qterms.iter().chain(look_terms.iter()) {
         let count = low.matches(term).count();
         if count > 0 {
             score += 2.0 + count as f64;
         }
     }
-    if chunk.router_rank.is_some_and(|rank| rank <= 3) {
+    if chunk.candidate.router_rank.is_some_and(|rank| rank <= 3) {
         score += 5.0;
     }
     score
@@ -3296,12 +3326,7 @@ fn verify_quotes(
             }
             exact_miss => {
                 if adapter_for(Path::new(&f.file)) != "markdown" {
-                    match exact_miss {
-                        QuoteMatch::LineMismatch(actual) => {
-                            dropped.push(drop_reason(&f, &format!("line_mismatch:{actual}")));
-                        }
-                        _ => dropped.push(drop_reason(&f, "quote_not_in_file")),
-                    }
+                    dropped.push(dropped_quote_miss(&f, exact_miss));
                     continue;
                 }
                 let markdown_lines: Vec<String> = normalized_lines
@@ -3317,12 +3342,7 @@ fn verify_quotes(
                     QuoteMatch::LineMismatch(actual) => {
                         dropped.push(drop_reason(&f, &format!("line_mismatch:{actual}")));
                     }
-                    QuoteMatch::NotFound => match exact_miss {
-                        QuoteMatch::LineMismatch(actual) => {
-                            dropped.push(drop_reason(&f, &format!("line_mismatch:{actual}")));
-                        }
-                        _ => dropped.push(drop_reason(&f, "quote_not_in_file")),
-                    },
+                    QuoteMatch::NotFound => dropped.push(dropped_quote_miss(&f, exact_miss)),
                 }
             }
         }
@@ -3334,6 +3354,15 @@ enum QuoteMatch {
     Matched,
     LineMismatch(usize),
     NotFound,
+}
+
+fn dropped_quote_miss(finding: &Finding, miss: QuoteMatch) -> DroppedFinding {
+    match miss {
+        QuoteMatch::LineMismatch(actual) => {
+            drop_reason(finding, &format!("line_mismatch:{actual}"))
+        }
+        _ => drop_reason(finding, "quote_not_in_file"),
+    }
 }
 
 fn quote_match(lines: &[String], quote: &str, cited_line: usize) -> QuoteMatch {
@@ -3401,16 +3430,14 @@ fn drop_reason(f: &Finding, reason: &str) -> DroppedFinding {
 }
 
 fn sort_findings(a: &Finding, b: &Finding) -> Ordering {
-    a.router_rank
-        .unwrap_or(usize::MAX)
-        .cmp(&b.router_rank.unwrap_or(usize::MAX))
-        .then_with(|| {
-            b.deterministic_score
-                .partial_cmp(&a.deterministic_score)
-                .unwrap_or(Ordering::Equal)
-        })
-        .then_with(|| a.file.cmp(&b.file))
-        .then_with(|| a.line.cmp(&b.line))
+    router_rank_score_order(
+        a.router_rank,
+        a.deterministic_score,
+        b.router_rank,
+        b.deterministic_score,
+    )
+    .then_with(|| a.file.cmp(&b.file))
+    .then_with(|| a.line.cmp(&b.line))
 }
 
 fn is_weak_signal(findings: &[Finding], top_candidate_score: f64) -> bool {
@@ -3510,30 +3537,33 @@ fn prune_query_runs(runs: &Path, keep: usize) -> Result<()> {
 }
 
 fn insert_data_field(data: &mut Value, key: &str, value: Value) {
-    if let Value::Object(map) = data {
-        map.insert(key.into(), value);
-    }
+    data.as_object_mut()
+        .expect("envelope data is always an object")
+        .insert(key.into(), value);
 }
 
-fn compact_findings(findings: &[Finding]) -> Vec<Value> {
+#[derive(Debug, Serialize)]
+struct CompactFinding<'a> {
+    file: &'a str,
+    line: usize,
+    fact: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote: Option<&'a str>,
+    quote_omitted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_tier: Option<&'a str>,
+}
+
+fn compact_findings(findings: &[Finding]) -> Vec<CompactFinding<'_>> {
     findings
         .iter()
-        .map(|f| {
-            let mut value = json!({
-                "file": &f.file,
-                "line": f.line,
-                "fact": &f.fact,
-                "quote": &f.quote,
-                "quote_omitted": f.quote_omitted,
-                "match_tier": &f.match_tier,
-            });
-            if f.quote.is_none() {
-                value.as_object_mut().unwrap().remove("quote");
-            }
-            if f.match_tier.is_none() {
-                value.as_object_mut().unwrap().remove("match_tier");
-            }
-            value
+        .map(|finding| CompactFinding {
+            file: &finding.file,
+            line: finding.line,
+            fact: &finding.fact,
+            quote: finding.quote.as_deref(),
+            quote_omitted: finding.quote_omitted,
+            match_tier: finding.match_tier.as_deref(),
         })
         .collect()
 }
@@ -3552,14 +3582,14 @@ fn pack_findings(mut findings: Vec<Finding>, budget_tokens: Option<usize>) -> Ve
     };
     let mut used = 200usize;
     for f in &mut findings {
-        let quoted = serde_json::to_string(f).unwrap_or_default();
+        let quoted = serde_json::to_string(f).unwrap();
         let cost = estimate_tokens(&quoted);
         if used + cost <= limit {
             used += cost;
         } else {
             f.quote = None;
             f.quote_omitted = true;
-            used += estimate_tokens(&serde_json::to_string(f).unwrap_or_default());
+            used += estimate_tokens(&serde_json::to_string(f).unwrap());
         }
     }
     findings
@@ -3756,37 +3786,33 @@ struct IndexEstimate {
 fn incremental_index_estimate(root: &Path, markdown_only: bool) -> Result<IndexEstimate> {
     let (files, _) = walk_corpus(root, false, markdown_only)?;
     let model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    let old = open_snapshot(root)
-        .ok()
-        .and_then(|s| load_cards(&s).ok().map(|c| (s.manifest, c)));
-    let can_reuse = old
-        .as_ref()
-        .is_some_and(|(m, _)| manifest_compatible(m, &model, root));
-    let old_by_key: HashMap<(String, String), Card> = old
-        .as_ref()
-        .map(|(_, cards)| {
-            cards
-                .iter()
-                .map(|c| ((c.path.clone(), c.hash.clone()), c.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let to_card = files_to_card(&files, can_reuse, &old_by_key);
+    let old_by_key = reusable_cards_by_key(root, &model);
+    let to_card = files_to_card(&files, &old_by_key);
     Ok(IndexEstimate {
         usd: estimate_index_cost_refs(&to_card),
         files_to_card: to_card.len(),
     })
 }
 
+fn reusable_cards_by_key(root: &Path, model: &str) -> HashMap<(String, String), Card> {
+    open_snapshot(root)
+        .ok()
+        .filter(|snapshot| manifest_compatible(&snapshot.manifest, model, root))
+        .and_then(|snapshot| load_cards(&snapshot).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|card| ((card.path.clone(), card.hash.clone()), card))
+        .collect()
+}
+
 fn files_to_card<'a>(
     files: &'a [WalkedFile],
-    can_reuse: bool,
     old_by_key: &HashMap<(String, String), Card>,
 ) -> Vec<&'a WalkedFile> {
     files
         .iter()
         .filter(|f| !matches!(f.adapter.as_str(), "pdf" | "docx") || !f.text.is_empty())
-        .filter(|f| !can_reuse || !old_by_key.contains_key(&(f.rel.clone(), f.hash.clone())))
+        .filter(|f| !old_by_key.contains_key(&(f.rel.clone(), f.hash.clone())))
         .collect()
 }
 
@@ -3831,7 +3857,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 fn truncate_json_value(value: Value, tokens: usize) -> Value {
-    let s = serde_json::to_string(&value).unwrap_or_default();
+    let s = serde_json::to_string(&value).unwrap();
     if estimate_tokens(&s) <= tokens {
         value
     } else {
@@ -3922,6 +3948,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cerebras_response_has_typed_content_and_usage() {
+        let response: CerebrasResponse = serde_json::from_value(json!({
+            "choices": [{"message": {"content": "answer"}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3}
+        }))
+        .unwrap();
+        assert_eq!(response.choices[0].message.content, "answer");
+        assert_eq!(response.usage.prompt_tokens, 12);
+        assert_eq!(response.usage.completion_tokens, 3);
+    }
+
+    #[test]
     fn redacts_outbound_secret_shapes_but_keeps_path_like_entropy() {
         let input = "email trey@example.com\nopenai sk-1234567890abcdef\naws AKIA1234567890ABCDEF\ngithub ghp_1234567890abcdefghijklmnopqrstuvwxyz\nbearer Bearer abcdefghijklmnopqrstuvwxyz123456\nkv password = hunter2\nhome /Users/treygoff/Code/scout\npath abcdefghijklmnopqrstuvwxyz123456/foo/bar\n";
         let (out, count) = redact_outbound(input);
@@ -3967,6 +4005,28 @@ mod tests {
         let err = cmd_query(&["hello".into(), "--budgett".into()]).unwrap_err();
         assert!(err.downcast_ref::<UsageError>().is_some());
         assert!(err.to_string().contains("unknown query flag --budgett"));
+    }
+
+    #[test]
+    fn corpus_parser_shares_common_flags_without_widening_brief() {
+        let args = [
+            "corpus".into(),
+            "--budget".into(),
+            "8k".into(),
+            "--max-dollars".into(),
+            "1.5".into(),
+            "--refresh".into(),
+            "--pretty".into(),
+            "--compact".into(),
+        ];
+        let parsed = parse_corpus_args(&args, "query").unwrap();
+        assert_eq!(parsed.dir, "corpus");
+        assert_eq!(parsed.budget_tokens, Some(8_000));
+        assert_eq!(parsed.max_dollars, Some(1.5));
+        assert!(parsed.refresh && parsed.pretty && parsed.compact);
+
+        let err = parse_corpus_args(&["--compact".into()], "brief").unwrap_err();
+        assert!(err.to_string().contains("unknown brief flag --compact"));
     }
 
     #[test]
@@ -4538,9 +4598,10 @@ mod tests {
             match_tier: Some("exact".into()),
         }];
         let compact = compact_findings(&findings);
-        assert!(compact[0].get("router_rank").is_none());
-        assert!(compact[0].get("deterministic_score").is_none());
-        assert_eq!(compact[0]["match_tier"], "exact");
+        let compact_json = serde_json::to_value(&compact[0]).unwrap();
+        assert!(compact_json.get("router_rank").is_none());
+        assert!(compact_json.get("deterministic_score").is_none());
+        assert_eq!(compact[0].match_tier, Some("exact"));
         let counts = dropped_reason_counts(&[
             drop_with_reason("quote_not_in_file"),
             drop_with_reason("quote_not_in_file"),
@@ -4678,12 +4739,14 @@ mod tests {
     fn ranked_chunks_respects_cap_even_with_many_files() {
         let chunks = (0..10)
             .map(|i| Chunk {
-                file: format!("f{i}.rs"),
+                candidate: Candidate {
+                    path: format!("f{i}.rs"),
+                    router_rank: Some(i + 1),
+                    deterministic_score: i as f64,
+                    look_for: None,
+                },
                 first_line: 1,
                 body: format!("query term {i}"),
-                router_rank: Some(i + 1),
-                deterministic_score: i as f64,
-                look_for: None,
             })
             .collect();
         let ranked = rank_chunks(chunks, "query term", 3);

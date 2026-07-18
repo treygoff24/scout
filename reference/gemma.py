@@ -1,5 +1,4 @@
 """Minimal Cerebras chat client. stdlib only — requests isn't installed here."""
-import base64
 import json
 import os
 import threading
@@ -28,11 +27,9 @@ PRICE = {  # $/MTok (input, output)
 _lock = threading.Lock()
 spend = {"in_tok": 0, "out_tok": 0, "usd": 0.0, "calls": 0}
 
-def chat(messages, model="gemma-4-31b", tools=None, retries=6, **kw):
+def chat(messages, model="gemma-4-31b", retries=6, **kw):
     """One chat completion. Returns full parsed response with wall_s added."""
     body = {"model": model, "messages": messages, "stream": False, **kw}
-    if tools:
-        body["tools"] = tools
     req = urllib.request.Request(
         API,
         data=json.dumps(body).encode(),
@@ -63,42 +60,8 @@ def chat(messages, model="gemma-4-31b", tools=None, retries=6, **kw):
                 continue
             raise RuntimeError(f"HTTP {e.code}: {e.read().decode()[:500]}") from e
 
-def img_part(path, max_b=3_000_000, max_px=1600, force=False):
-    """Image file -> content part dict (base64 data URI). Normalizes HEIC/GIF/no-ext/oversize via sips (macOS) into scratch/imgcache/. force=True re-encodes even well-named files (they sometimes lie about their format)."""
-    import hashlib
-    import subprocess
-    ext = os.path.splitext(path)[1].lower().lstrip(".")
-    if force or ext not in ("jpg", "jpeg", "png") or os.path.getsize(path) > max_b:
-        cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scratch", "imgcache")
-        os.makedirs(cache, exist_ok=True)
-        out = os.path.join(cache, hashlib.md5(path.encode()).hexdigest() + ".jpg")
-        if not os.path.exists(out):
-            subprocess.run(
-                ["sips", "-s", "format", "jpeg", "-s", "formatOptions", "80",
-                 "-Z", str(max_px), path, "--out", out],
-                check=True, capture_output=True)
-        path, ext = out, "jpg"
-    raw = open(path, "rb").read()
-    assert len(raw) < 9_000_000, f"{path} still too big ({len(raw)}b)"
-    return {"type": "image_url", "image_url": {"url": f"data:image/{ext.replace('jpg', 'jpeg')};base64,{base64.b64encode(raw).decode()}"}}
-
 def text(resp):
     return resp["choices"][0]["message"].get("content")
-
-def jloads(resp_or_text):
-    """Parse model-emitted JSON, repairing gemma's known quirks: stray control chars and literal \\u not followed by 4 hex digits (both seen with accented text)."""
-    import re
-    s = resp_or_text if isinstance(resp_or_text, str) else text(resp_or_text)
-    s = s.strip()
-    if s.startswith("```"):  # strip ```json ... ``` fences (gemma loves them)
-        s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
-        s = re.sub(r"\n?```$", "", s.strip())
-    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
-    s = re.sub(r"\\u(?![0-9a-fA-F]{4})", r"\\\\u", s)
-    return json.loads(s)
-
-def calls(resp):
-    return resp["choices"][0]["message"].get("tool_calls") or []
 
 def report():
     return f"{spend['calls']} calls, {spend['in_tok']} in / {spend['out_tok']} out tok, ${spend['usd']:.4f}"
