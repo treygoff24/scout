@@ -63,6 +63,31 @@ const STATE_EXIT_CODES: &[(&str, i32)] = &[
     ("internal_error", 1),
 ];
 
+fn configured_model() -> String {
+    env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
+}
+
+fn configured_usize(name: &str, default: usize) -> Result<usize> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .with_context(|| format!("invalid {name}: expected a non-negative integer")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(err).with_context(|| format!("invalid {name}")),
+    }
+}
+
+fn provider_api_key() -> Option<String> {
+    env::var("CEREBRAS_API_KEY")
+        .or_else(|_| env::var("SCOUT_API_KEY"))
+        .ok()
+}
+
+fn token_cost(input_tokens: u64, output_tokens: u64) -> f64 {
+    input_tokens as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK
+        + output_tokens as f64 / 1_000_000.0 * OUTPUT_DOLLARS_PER_MTOK
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScoutErrorKind {
     Usage,
@@ -99,8 +124,7 @@ impl Spend {
         self.out_tok += usage.completion_tokens;
         self.calls += 1;
         self.retries += retries;
-        self.usd += usage.prompt_tokens as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK
-            + usage.completion_tokens as f64 / 1_000_000.0 * OUTPUT_DOLLARS_PER_MTOK;
+        self.usd += token_cost(usage.prompt_tokens, usage.completion_tokens);
     }
 
     fn merge(&mut self, other: &Spend) {
@@ -313,6 +337,10 @@ struct Snapshot {
     manifest: Manifest,
 }
 
+fn generation_name(gen_dir: &Path) -> String {
+    gen_dir.file_name().unwrap().to_string_lossy().into_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Message {
     role: String,
@@ -343,19 +371,15 @@ impl Message {
     }
 }
 
-#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy)]
 struct Usage {
-    #[serde(default)]
     prompt_tokens: u64,
-    #[serde(default)]
     completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct CerebrasResponse {
-    #[serde(default)]
     choices: Vec<CerebrasChoice>,
-    #[serde(default)]
     usage: Usage,
 }
 
@@ -380,14 +404,12 @@ struct CerebrasClient {
 
 impl CerebrasClient {
     fn from_env(spend: Arc<Mutex<Spend>>) -> Result<Self> {
-        let api_key = env::var("CEREBRAS_API_KEY")
-            .or_else(|_| env::var("SCOUT_API_KEY"))
-            .map_err(|_| {
-                provider_error(
-                    "CEREBRAS_API_KEY is missing; scout will not fake or mock provider results",
-                )
-            })?;
-        let model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let api_key = provider_api_key().ok_or_else(|| {
+            provider_error(
+                "CEREBRAS_API_KEY is missing; scout will not fake or mock provider results",
+            )
+        })?;
+        let model = configured_model();
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(120))
             .user_agent(USER_AGENT)
@@ -797,7 +819,7 @@ fn next_money_arg(args: &[String], index: &mut usize, flag: &str) -> Result<f64>
 
 fn confirm_spend(prompt: &str) -> Result<bool> {
     eprint!("{prompt}");
-    io::stderr().flush().ok();
+    io::stderr().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     Ok(line.trim().eq_ignore_ascii_case("y"))
@@ -918,8 +940,8 @@ fn cmd_index(args: &[String]) -> Result<i32> {
         fs::canonicalize(&dir).map_err(|err| usage_error(format!("cannot read {dir}: {err}")))?;
     let markdown_only = env::var("SCOUT_MARKDOWN_ONLY").ok().as_deref() == Some("1");
     let (files, mut skipped) = walk_corpus(&root, markdown_only)?;
-    let model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    let old_by_key = reusable_cards_by_key(&root, &model);
+    let model = configured_model();
+    let old_by_key = reusable_cards_by_key(&root, &model)?;
     let estimate_files = files_to_card(&files, &old_by_key);
     let estimate = estimate_index_cost_refs(&estimate_files);
     eprintln!(
@@ -1030,7 +1052,7 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     let gen_dir = write_generation(&root, &manifest, &cards)?;
     prune_generations(&root, 2).ok();
     let mut env = Envelope::for_root("index", state, &root).with_data(IndexData {
-        generation: gen_dir.file_name().unwrap().to_string_lossy().into_owned(),
+        generation: generation_name(&gen_dir),
         cards: manifest.cards,
         estimated_usd: estimate,
         unsupported: coverage_skips(&manifest),
@@ -1042,15 +1064,11 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     finish_env(&env, pretty)
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct GeneratedCard {
-    #[serde(default)]
     role: String,
-    #[serde(default)]
     invariants: Vec<String>,
-    #[serde(default)]
     gotchas: Vec<String>,
-    #[serde(default)]
     terms: Vec<String>,
 }
 
@@ -1083,10 +1101,8 @@ fn generate_card(
                 provider_error(format!("{err:#}"))
             }
         })?;
-    let value: GeneratedCard = parse_jsonish(&raw).unwrap_or_else(|_| GeneratedCard {
-        role: deterministic_role(&file.rel, &file.text),
-        ..GeneratedCard::default()
-    });
+    let value: GeneratedCard =
+        parse_jsonish(&raw).map_err(|err| provider_error(format!("invalid card JSON: {err}")))?;
     Ok(GeneratedCard {
         role: card_role(&value.role),
         invariants: value.invariants.into_iter().take(8).collect(),
@@ -1169,8 +1185,7 @@ fn index_state_after_card_generation(
 #[derive(Debug, Clone)]
 struct RefreshResult {
     spend: Spend,
-    estimated_usd: f64,
-    generation: String,
+    refreshed_index: RefreshedIndexData,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1194,14 +1209,14 @@ struct QueryRefreshData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct QueryResultData {
+struct QueryResultData<F = Vec<Finding>, D = Vec<DroppedFinding>> {
     query: String,
     generation: String,
     candidate_files: Vec<String>,
     chunks: usize,
     chunk_mode: String,
-    findings: Vec<Finding>,
-    dropped: Vec<DroppedFinding>,
+    findings: F,
+    dropped: D,
     weak_signal: bool,
     budget_hit: Option<String>,
     #[serde(flatten)]
@@ -1211,11 +1226,11 @@ struct QueryResultData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct EmptyQueryResultData {
+struct EmptyQueryResultData<F = Vec<Finding>, D = Vec<DroppedFinding>> {
     query: String,
     generation: String,
-    findings: Vec<Finding>,
-    dropped: Vec<DroppedFinding>,
+    findings: F,
+    dropped: D,
     candidate_files: Vec<String>,
     weak_signal: bool,
     #[serde(flatten)]
@@ -1307,10 +1322,7 @@ fn merge_query_refresh_result(env: &mut QueryEnvelope, result: Option<&RefreshRe
         return;
     };
     env.spend.merge(&result.spend);
-    env.data.refresh_mut().refreshed_index = Some(RefreshedIndexData {
-        estimated_usd: result.estimated_usd,
-        generation: result.generation.clone(),
-    });
+    env.data.refresh_mut().refreshed_index = Some(result.refreshed_index.clone());
 }
 
 #[derive(Serialize)]
@@ -1336,9 +1348,9 @@ fn refresh_index_if_needed(
     max_dollars: Option<f64>,
     markdown_only: bool,
 ) -> Result<RefreshDecision> {
-    let current = open_snapshot(root)
-        .ok()
-        .and_then(|snapshot| load_cards(&snapshot).ok().map(|cards| (snapshot, cards)));
+    let current = open_snapshot_if_present(root)?
+        .map(|snapshot| load_cards(&snapshot).map(|cards| (snapshot, cards)))
+        .transpose()?;
     let stale = current
         .as_ref()
         .map(|(snapshot, cards)| staleness_report(root, &snapshot.manifest, cards))
@@ -1378,8 +1390,10 @@ fn refresh_index_if_needed(
         .into_owned();
     Ok(RefreshDecision::Refreshed(RefreshResult {
         spend,
-        estimated_usd: estimate.usd,
-        generation,
+        refreshed_index: RefreshedIndexData {
+            estimated_usd: estimate.usd,
+            generation,
+        },
     }))
 }
 
@@ -1422,8 +1436,10 @@ fn cmd_query(args: &[String]) -> Result<i32> {
 
 fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(QueryEnvelope, i32)> {
     let total_start = Instant::now();
-    let snapshot = open_snapshot(root).map_err(|_| anyhow!("index_missing"))?;
+    let snapshot = open_snapshot_if_present(root)?.ok_or_else(|| anyhow!("index_missing"))?;
     let cards = load_cards(&snapshot)?;
+    let chunk_cap = configured_usize("SCOUT_CHUNK_CAP", 24)?;
+    let concurrency = configured_usize("SCOUT_CONCURRENCY", DEFAULT_CONCURRENCY)?;
     let stale = staleness_report(root, &snapshot.manifest, &cards)?;
     if stale.stale {
         let env = Envelope::for_root("query", "index_stale", root).with_data(QueryData::Stale(
@@ -1439,9 +1455,8 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Que
     }
     let files = read_card_files(root, &cards)?;
     let deterministic = deterministic_candidates(query, &cards, &files, DEFAULT_CANDIDATES);
-    let router_estimate = estimate_tokens(&thin_cards_json(query, &cards)) as f64 / 1_000_000.0
-        * INPUT_DOLLARS_PER_MTOK
-        + 0.003;
+    let router_estimate =
+        token_cost(estimate_tokens(&thin_cards_json(query, &cards)) as u64, 0) + 0.003;
     eprintln!(
         "scout query estimate before router spend: ~${:.4}",
         router_estimate
@@ -1476,12 +1491,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Que
         let mut env = Envelope::for_root("query", "unanswered", root).with_data(QueryData::Empty(
             EmptyQueryResultData {
                 query: query.into(),
-                generation: snapshot
-                    .gen_dir
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
+                generation: generation_name(&snapshot.gen_dir),
                 findings: Vec::new(),
                 dropped: Vec::new(),
                 candidate_files: Vec::new(),
@@ -1496,7 +1506,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Que
         return Ok(with_exit_code(env));
     }
     let mode = env::var("SCOUT_CHUNK_MODE").unwrap_or_else(|_| "ranked_boundary".into());
-    let chunks = build_chunks(&candidates, &files, &mode, query);
+    let chunks = build_chunks(&candidates, &files, &mode, query, chunk_cap);
     let extractor_estimate = estimate_chunks_cost(&chunks);
     eprintln!(
         "scout query estimate before extractor spend: {} chunks, ~${:.4}",
@@ -1504,12 +1514,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Que
         extractor_estimate
     );
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(
-            env::var("SCOUT_CONCURRENCY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_CONCURRENCY),
-        )
+        .num_threads(concurrency)
         .build()?;
     let results: Vec<_> = pool.install(|| {
         chunks
@@ -1543,12 +1548,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Que
     let mut env =
         Envelope::for_root("query", state, root).with_data(QueryData::Result(QueryResultData {
             query: query.into(),
-            generation: snapshot
-                .gen_dir
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            generation: generation_name(&snapshot.gen_dir),
             candidate_files: candidate_paths,
             chunks: chunks.len(),
             chunk_mode: mode,
@@ -1610,8 +1610,7 @@ fn extract_chunk(
     query: &str,
     chunk: &Chunk,
 ) -> Result<Vec<Finding>, DroppedFinding> {
-    let projected =
-        estimate_tokens(&chunk.body) as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK + 0.006;
+    let projected = token_cost(estimate_tokens(&chunk.body) as u64, 0) + 0.006;
     if !gate.may_launch(&client.spend, projected) {
         return Err(drop_chunk(chunk, "budget_hit_before_chunk", None));
     }
@@ -1755,9 +1754,9 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
     } else {
         None
     };
-    let snapshot = match open_snapshot(&root) {
-        Ok(s) => s,
-        Err(_) => {
+    let snapshot = match open_snapshot_if_present(&root)? {
+        Some(snapshot) => snapshot,
+        None => {
             let env = Envelope::for_root("brief", "index_missing", &root).with_data(HintData {
                 hint: "run scout index",
             });
@@ -1799,12 +1798,7 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
     let unsupported = coverage_skips(&snapshot.manifest);
     let stale_reason = stale.stale.then(|| stale.reason.clone());
     let data = BriefData {
-        generation: snapshot
-            .gen_dir
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned(),
+        generation: generation_name(&snapshot.gen_dir),
         module_map: dirs,
         entry_points,
         coverage_note: coverage_note(&unsupported),
@@ -1813,10 +1807,9 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
         stale_reason,
         changed_files: stale.changed_files,
     };
-    let refreshed_index = refresh_result.as_ref().map(|result| RefreshedIndexData {
-        estimated_usd: result.estimated_usd,
-        generation: result.generation.clone(),
-    });
+    let refreshed_index = refresh_result
+        .as_ref()
+        .map(|result| result.refreshed_index.clone());
     let mut env = Envelope::for_root("brief", "ok", &root).with_data(brief_output_data(
         data,
         options.budget_tokens,
@@ -2076,20 +2069,15 @@ fn cmd_doctor(args: &[String]) -> Result<i32> {
         pdftotext: command_exists("pdftotext"),
         pandoc: command_exists("pandoc"),
     };
-    let has_key = env::var("CEREBRAS_API_KEY").is_ok() || env::var("SCOUT_API_KEY").is_ok();
-    let index = open_snapshot(&root).ok();
+    let has_key = provider_api_key().is_some();
+    let index = open_snapshot_if_present(&root)?;
     let mut env = Envelope::new("doctor", "ok").with_data(DoctorData {
         api_key_present: has_key,
-        model: env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
+        model: configured_model(),
         user_agent: USER_AGENT,
         tools,
         index: index.map(|snapshot| DoctorIndexData {
-            generation: snapshot
-                .gen_dir
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            generation: generation_name(&snapshot.gen_dir),
             cards: snapshot.manifest.cards,
         }),
         degraded: DegradedAdapters {
@@ -3254,6 +3242,13 @@ fn open_snapshot(root: &Path) -> Result<Snapshot> {
     Ok(Snapshot { gen_dir, manifest })
 }
 
+fn open_snapshot_if_present(root: &Path) -> Result<Option<Snapshot>> {
+    if !root.join(".scout/current").try_exists()? {
+        return Ok(None);
+    }
+    open_snapshot(root).map(Some)
+}
+
 fn load_cards(snapshot: &Snapshot) -> Result<Vec<Card>> {
     let raw = fs::read_to_string(snapshot.gen_dir.join("cards.jsonl"))?;
     raw.lines()
@@ -3382,11 +3377,7 @@ fn changed_files_since_cards(root: &Path, manifest: &Manifest, cards: &[Card]) -
 }
 
 fn manifest_current(m: &Manifest, root: &Path) -> bool {
-    manifest_compatible(
-        m,
-        &env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
-        root,
-    )
+    manifest_compatible(m, &configured_model(), root)
 }
 
 fn manifest_compatible(m: &Manifest, model: &str, root: &Path) -> bool {
@@ -3451,9 +3442,7 @@ fn route_with_model(
     #[derive(Deserialize)]
     struct RouterFile {
         path: String,
-        #[serde(default)]
         look_for: String,
-        #[serde(default)]
         rank: usize,
     }
     let valid: HashSet<&str> = cards.iter().map(|c| c.path.as_str()).collect();
@@ -3621,6 +3610,7 @@ fn build_chunks(
     files: &FileContents,
     mode: &str,
     query: &str,
+    cap: usize,
 ) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let chunk_mode = if mode == "ranked_boundary" {
@@ -3638,14 +3628,7 @@ fn build_chunks(
         }
     }
     if mode == "ranked_boundary" {
-        rank_chunks(
-            chunks,
-            query,
-            env::var("SCOUT_CHUNK_CAP")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(24),
-        )
+        rank_chunks(chunks, query, cap)
     } else {
         chunks
     }
@@ -3952,7 +3935,7 @@ fn query_stdout_envelope(
     let data = match &env.data {
         QueryData::Result(data) => {
             let findings = pack_findings(data.findings.clone(), budget_tokens);
-            QueryOutputData::Result(QueryResultOutputData {
+            QueryOutputData::Result(QueryResultData {
                 query: data.query.clone(),
                 generation: data.generation.clone(),
                 candidate_files: data.candidate_files.clone(),
@@ -3966,7 +3949,7 @@ fn query_stdout_envelope(
                 refresh: data.refresh.clone(),
             })
         }
-        QueryData::Empty(data) => QueryOutputData::Empty(EmptyQueryResultOutputData {
+        QueryData::Empty(data) => QueryOutputData::Empty(EmptyQueryResultData {
             query: data.query.clone(),
             generation: data.generation.clone(),
             findings: output_findings(pack_findings(data.findings.clone(), budget_tokens), compact),
@@ -4050,41 +4033,10 @@ enum OutputDropped {
 }
 
 #[derive(Serialize)]
-struct QueryResultOutputData {
-    query: String,
-    generation: String,
-    candidate_files: Vec<String>,
-    chunks: usize,
-    chunk_mode: String,
-    findings: OutputFindings,
-    dropped: OutputDropped,
-    weak_signal: bool,
-    budget_hit: Option<String>,
-    #[serde(flatten)]
-    artifacts: QueryArtifactPaths,
-    #[serde(flatten)]
-    refresh: QueryRefreshData,
-}
-
-#[derive(Serialize)]
-struct EmptyQueryResultOutputData {
-    query: String,
-    generation: String,
-    findings: OutputFindings,
-    dropped: OutputDropped,
-    candidate_files: Vec<String>,
-    weak_signal: bool,
-    #[serde(flatten)]
-    artifacts: QueryArtifactPaths,
-    #[serde(flatten)]
-    refresh: QueryRefreshData,
-}
-
-#[derive(Serialize)]
 #[serde(untagged)]
 enum QueryOutputData {
-    Result(QueryResultOutputData),
-    Empty(EmptyQueryResultOutputData),
+    Result(QueryResultData<OutputFindings, OutputDropped>),
+    Empty(EmptyQueryResultData<OutputFindings, OutputDropped>),
 }
 
 fn output_findings(findings: Vec<Finding>, compact: bool) -> OutputFindings {
@@ -4320,8 +4272,8 @@ struct IndexEstimate {
 
 fn incremental_index_estimate(root: &Path, markdown_only: bool) -> Result<IndexEstimate> {
     let (files, _) = walk_corpus(root, markdown_only)?;
-    let model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    let old_by_key = reusable_cards_by_key(root, &model);
+    let model = configured_model();
+    let old_by_key = reusable_cards_by_key(root, &model)?;
     let to_card = files_to_card(&files, &old_by_key);
     Ok(IndexEstimate {
         usd: estimate_index_cost_refs(&to_card),
@@ -4329,15 +4281,17 @@ fn incremental_index_estimate(root: &Path, markdown_only: bool) -> Result<IndexE
     })
 }
 
-fn reusable_cards_by_key(root: &Path, model: &str) -> HashMap<(String, String), Card> {
-    open_snapshot(root)
-        .ok()
-        .filter(|snapshot| manifest_compatible(&snapshot.manifest, model, root))
-        .and_then(|snapshot| load_cards(&snapshot).ok())
-        .unwrap_or_default()
+fn reusable_cards_by_key(root: &Path, model: &str) -> Result<HashMap<(String, String), Card>> {
+    let Some(snapshot) = open_snapshot_if_present(root)? else {
+        return Ok(HashMap::new());
+    };
+    if !manifest_compatible(&snapshot.manifest, model, root) {
+        return Ok(HashMap::new());
+    }
+    Ok(load_cards(&snapshot)?
         .into_iter()
         .map(|card| ((card.path.clone(), card.hash.clone()), card))
-        .collect()
+        .collect())
 }
 
 fn files_to_card<'a>(
@@ -4353,17 +4307,16 @@ fn files_to_card<'a>(
 
 fn estimate_index_cost_refs(files: &[&WalkedFile]) -> f64 {
     let toks: usize = files.iter().map(|f| estimate_tokens(&f.text) + 700).sum();
-    toks as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK + files.len() as f64 * 0.001
+    token_cost(toks as u64, 0) + files.len() as f64 * 0.001
 }
 
 fn estimate_chunks_cost(chunks: &[Chunk]) -> f64 {
     let toks: usize = chunks.iter().map(|c| estimate_tokens(&c.body) + 700).sum();
-    toks as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK + chunks.len() as f64 * 0.006
+    token_cost(toks as u64, 0) + chunks.len() as f64 * 0.006
 }
 
 fn estimate_chat_cost(input: &str, max_output_tokens: u64) -> f64 {
-    estimate_tokens(input) as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK
-        + max_output_tokens as f64 / 1_000_000.0 * OUTPUT_DOLLARS_PER_MTOK
+    token_cost(estimate_tokens(input) as u64, max_output_tokens)
 }
 
 fn parse_budget(s: &str) -> Result<usize> {
@@ -4486,6 +4439,14 @@ mod tests {
         assert_eq!(response.choices[0].message.content, "answer");
         assert_eq!(response.usage.prompt_tokens, 12);
         assert_eq!(response.usage.completion_tokens, 3);
+        assert!(serde_json::from_str::<CerebrasResponse>(r#"{"choices":[]}"#).is_err());
+        assert!(
+            serde_json::from_str::<CerebrasResponse>(
+                r#"{"choices":[],"usage":{"prompt_tokens":12}}"#
+            )
+            .is_err()
+        );
+        assert!(parse_jsonish::<GeneratedCard>(r#"{"role":"summary","invariants":[]}"#).is_err());
     }
 
     #[test]
@@ -5065,9 +5026,9 @@ mod tests {
             match_tier: Some("exact".into()),
         }];
         let compact = compact_findings(&findings);
-        let compact_json = serde_json::to_value(&compact[0]).unwrap();
-        assert!(compact_json.get("router_rank").is_none());
-        assert!(compact_json.get("deterministic_score").is_none());
+        let compact_json = serde_json::to_string(&compact[0]).unwrap();
+        assert!(!compact_json.contains("router_rank"));
+        assert!(!compact_json.contains("deterministic_score"));
         assert_eq!(compact[0].match_tier.as_deref(), Some("exact"));
         let counts = dropped_reason_counts(&[
             drop_with_reason("quote_not_in_file"),
@@ -5422,6 +5383,13 @@ mod tests {
 
     #[test]
     fn generation_snapshot_survives_one_prune_then_ages_out() {
+        let absent = tempfile::tempdir().unwrap();
+        assert!(open_snapshot_if_present(absent.path()).unwrap().is_none());
+        let corrupt = tempfile::tempdir().unwrap();
+        fs::create_dir(corrupt.path().join(".scout")).unwrap();
+        fs::write(corrupt.path().join(".scout/current"), "missing-generation").unwrap();
+        assert!(open_snapshot_if_present(corrupt.path()).is_err());
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let gen1 = write_test_generation(root, "old");
@@ -5548,7 +5516,7 @@ mod tests {
         let (files, _) = walk_corpus(&corpus, false).unwrap();
         let cards = files.iter().map(|f| skeletonize(f, 0)).collect::<Vec<_>>();
         let mut manifest = test_manifest_with_files(&corpus, cards.len(), &files);
-        manifest.model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
+        manifest.model = configured_model();
 
         fs::write(corpus.join("b.md"), "# B\n").unwrap();
         assert_eq!(

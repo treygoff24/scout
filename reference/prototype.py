@@ -13,14 +13,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable, Iterator, Mapping
-from typing import Literal, NotRequired, TypeAlias, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 import gemma
-
-
-JsonValue: TypeAlias = (
-    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
-)
 
 
 class RawFinding(TypedDict, total=False):
@@ -130,7 +125,7 @@ def extract(query: str, relpath: str, first_line: int, body: str) -> list[Extrac
     raw = r["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.M).strip()
     try:
-        parsed = cast(JsonValue, json.loads(raw))
+        parsed = cast(list[RawFinding], json.loads(raw))
         assert isinstance(parsed, list)
     except (json.JSONDecodeError, AssertionError):
         return [{"file": relpath, "error": "unparseable", "raw": raw[:200]}]
