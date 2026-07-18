@@ -64,38 +64,26 @@ const STATE_EXIT_CODES: &[(&str, i32)] = &[
     ("internal_error", 1),
 ];
 
-#[derive(Debug)]
-struct UsageError(String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScoutErrorKind {
+    Usage,
+    Provider,
+    BudgetHit,
+}
 
-impl std::fmt::Display for UsageError {
+#[derive(Debug)]
+struct ScoutError {
+    kind: ScoutErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for ScoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for UsageError {}
-
-#[derive(Debug)]
-struct ProviderError(String);
-
-impl std::fmt::Display for ProviderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ProviderError {}
-
-#[derive(Debug)]
-struct BudgetHitError(String);
-
-impl std::fmt::Display for BudgetHitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for BudgetHitError {}
+impl std::error::Error for ScoutError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Spend {
@@ -152,18 +140,37 @@ impl Envelope {
             errors: Vec::new(),
         }
     }
+
+    fn for_root(command: &str, state: &str, root: &Path) -> Self {
+        Self {
+            root: Some(root.display().to_string()),
+            ..Self::new(command, state)
+        }
+    }
 }
 
 fn usage_error(message: impl Into<String>) -> anyhow::Error {
-    anyhow!(UsageError(message.into()))
+    scout_error(ScoutErrorKind::Usage, message)
 }
 
 fn provider_error(message: impl Into<String>) -> anyhow::Error {
-    anyhow!(ProviderError(message.into()))
+    scout_error(ScoutErrorKind::Provider, message)
 }
 
 fn budget_hit_error(message: impl Into<String>) -> anyhow::Error {
-    anyhow!(BudgetHitError(message.into()))
+    scout_error(ScoutErrorKind::BudgetHit, message)
+}
+
+fn scout_error(kind: ScoutErrorKind, message: impl Into<String>) -> anyhow::Error {
+    anyhow!(ScoutError {
+        kind,
+        message: message.into(),
+    })
+}
+
+fn is_scout_error(err: &anyhow::Error, kind: ScoutErrorKind) -> bool {
+    err.downcast_ref::<ScoutError>()
+        .is_some_and(|err| err.kind == kind)
 }
 
 fn exit_code_for_state(state: &str) -> i32 {
@@ -196,6 +203,16 @@ struct Skip {
     path: String,
     reason: String,
     adapter: Option<String>,
+}
+
+impl Skip {
+    fn new(path: impl Into<String>, reason: impl Into<String>, adapter: Option<String>) -> Self {
+        Self {
+            path: path.into(),
+            reason: reason.into(),
+            adapter,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -610,11 +627,11 @@ fn main() {
     let code = match run() {
         Ok(code) => code,
         Err(err) => {
-            let state = if err.downcast_ref::<UsageError>().is_some() {
+            let state = if is_scout_error(&err, ScoutErrorKind::Usage) {
                 "usage_error"
-            } else if err.downcast_ref::<BudgetHitError>().is_some() {
+            } else if is_scout_error(&err, ScoutErrorKind::BudgetHit) {
                 "budget_hit"
-            } else if err.downcast_ref::<ProviderError>().is_some() {
+            } else if is_scout_error(&err, ScoutErrorKind::Provider) {
                 "provider_error"
             } else {
                 "internal_error"
@@ -811,13 +828,16 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     let mut yes = false;
     let mut pretty = false;
     let mut max_dollars = None;
-    let mut allow_sensitive = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--yes" | "-y" => yes = true,
             "--pretty" => pretty = true,
-            "--allow-sensitive" => allow_sensitive = true,
+            "--allow-sensitive" => {
+                return Err(usage_error(
+                    "--allow-sensitive is reserved for local-provider setups; this build only supports Cerebras and will not send sensitive files off-machine",
+                ));
+            }
             "--max-dollars" => {
                 max_dollars = Some(next_money_arg(args, &mut i, "--max-dollars")?);
             }
@@ -826,23 +846,15 @@ fn cmd_index(args: &[String]) -> Result<i32> {
         }
         i += 1;
     }
-    if allow_sensitive {
-        return Err(usage_error(
-            "--allow-sensitive is reserved for local-provider setups; this build only supports Cerebras and will not send sensitive files off-machine",
-        ));
-    }
     let start = Instant::now();
     let root =
         fs::canonicalize(&dir).map_err(|err| usage_error(format!("cannot read {dir}: {err}")))?;
     let markdown_only = env::var("SCOUT_MARKDOWN_ONLY").ok().as_deref() == Some("1");
-    let (files, mut skipped) = walk_corpus(&root, false, markdown_only)?;
+    let (files, mut skipped) = walk_corpus(&root, markdown_only)?;
     let model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     let old_by_key = reusable_cards_by_key(&root, &model);
-    let estimate_files: Vec<WalkedFile> = files_to_card(&files, &old_by_key)
-        .into_iter()
-        .cloned()
-        .collect();
-    let estimate = estimate_index_cost(&estimate_files);
+    let estimate_files = files_to_card(&files, &old_by_key);
+    let estimate = estimate_index_cost_refs(&estimate_files);
     eprintln!(
         "scout index estimate before spend: {} files to card, ~${:.4}",
         estimate_files.len(),
@@ -851,8 +863,7 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     if let Some(cap) = max_dollars
         && estimate > cap
     {
-        let mut env = Envelope::new("index", "budget_hit");
-        env.root = Some(root.display().to_string());
+        let mut env = Envelope::for_root("index", "budget_hit", &root);
         env.skipped = skipped;
         env.data = json!({"estimated_usd": estimate, "max_dollars": cap});
         return finish_env(&env, pretty);
@@ -862,8 +873,7 @@ fn cmd_index(args: &[String]) -> Result<i32> {
         && io::stdin().is_terminal()
         && !confirm_spend("Proceed with index spend? [y/N] ")?
     {
-        let mut env = Envelope::new("index", "budget_hit");
-        env.root = Some(root.display().to_string());
+        let mut env = Envelope::for_root("index", "budget_hit", &root);
         env.data = json!({"cancelled": true, "estimated_usd": estimate});
         return finish_env(&env, pretty);
     }
@@ -877,11 +887,11 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     let mut unsupported = Vec::new();
     for file in files {
         if matches!(file.adapter.as_str(), "pdf" | "docx") && file.text.is_empty() {
-            unsupported.push(Skip {
-                path: file.rel,
-                reason: "unsupported_or_tool_missing".into(),
-                adapter: Some(file.adapter),
-            });
+            unsupported.push(Skip::new(
+                file.rel,
+                "unsupported_or_tool_missing",
+                Some(file.adapter),
+            ));
             continue;
         }
         let skeleton = skeletonize(&file, *churn.get(&file.rel).unwrap_or(&0));
@@ -901,11 +911,7 @@ fn cmd_index(args: &[String]) -> Result<i32> {
         let path = file.rel.clone();
         let adapter = Some(file.adapter.clone());
         if gate.hit().is_some() {
-            skipped.push(Skip {
-                path,
-                reason: "budget_hit".into(),
-                adapter,
-            });
+            skipped.push(Skip::new(path, "budget_hit", adapter));
         } else {
             record_card_result(
                 &mut cards,
@@ -934,8 +940,7 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     };
     let state = index_state_after_card_generation(&cards, &skipped, &manifest.unsupported);
     if matches!(state, "provider_error" | "budget_hit") {
-        let mut env = Envelope::new("index", state);
-        env.root = Some(root.display().to_string());
+        let mut env = Envelope::for_root("index", state, &root);
         env.spend = spend.lock().unwrap().clone();
         env.skipped = skipped;
         env.errors.push(if state == "budget_hit" {
@@ -954,8 +959,7 @@ fn cmd_index(args: &[String]) -> Result<i32> {
     }
     let gen_dir = write_generation(&root, &manifest, &cards)?;
     prune_generations(&root, 2).ok();
-    let mut env = Envelope::new("index", state);
-    env.root = Some(root.display().to_string());
+    let mut env = Envelope::for_root("index", state, &root);
     env.spend = spend.lock().unwrap().clone();
     env.skipped = skipped;
     env.timings_ms
@@ -1004,7 +1008,7 @@ fn generate_card(
             Some(gate),
         )
         .map_err(|err| {
-            if err.downcast_ref::<BudgetHitError>().is_some() {
+            if is_scout_error(&err, ScoutErrorKind::BudgetHit) {
                 err
             } else {
                 provider_error(format!("{err:#}"))
@@ -1054,16 +1058,12 @@ fn record_card_result(
     match result {
         Ok(card) => cards.push(card),
         Err(err) => {
-            let reason = if err.downcast_ref::<BudgetHitError>().is_some() {
+            let reason = if is_scout_error(&err, ScoutErrorKind::BudgetHit) {
                 "budget_hit".into()
             } else {
                 format!("provider_error: {}", brief_error(&err))
             };
-            skipped.push(Skip {
-                path,
-                reason,
-                adapter,
-            });
+            skipped.push(Skip::new(path, reason, adapter));
         }
     }
 }
@@ -1142,8 +1142,7 @@ fn refresh_index_if_needed(
     if let Some(cap) = max_dollars
         && estimate.usd > cap
     {
-        let mut env = Envelope::new(command, "budget_hit");
-        env.root = Some(root.display().to_string());
+        let mut env = Envelope::for_root(command, "budget_hit", root);
         env.data = json!({
             "hint": "run scout index --max-dollars with a higher cap",
             "estimated_usd": estimate.usd,
@@ -1153,8 +1152,7 @@ fn refresh_index_if_needed(
         return Ok(RefreshDecision::Refused(env));
     }
     if estimate.usd > REFRESH_AUTO_YES_MAX_USD {
-        let mut env = Envelope::new(command, "budget_hit");
-        env.root = Some(root.display().to_string());
+        let mut env = Envelope::for_root(command, "budget_hit", root);
         env.data = json!({
             "hint": "refresh estimate exceeds auto-confirm threshold; run scout index --yes first",
             "estimated_usd": estimate.usd,
@@ -1164,14 +1162,12 @@ fn refresh_index_if_needed(
         return Ok(RefreshDecision::Refused(env));
     }
     let spend = cmd_index_internal(&root.display().to_string(), max_dollars, markdown_only)?;
-    let generation = open_snapshot(root)
-        .ok()
-        .and_then(|s| {
-            s.gen_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-        })
-        .unwrap_or_default();
+    let generation = open_snapshot(root)?
+        .gen_dir
+        .file_name()
+        .context("refreshed index generation has no file name")?
+        .to_string_lossy()
+        .into_owned();
     Ok(RefreshDecision::Refreshed(RefreshResult {
         spend,
         estimated_usd: estimate.usd,
@@ -1201,15 +1197,14 @@ fn cmd_query(args: &[String]) -> Result<i32> {
             merge_refresh_result(&mut env, refresh_result.as_ref());
             persist_query_artifacts(&root, &mut env)?;
             let emitted = finish_env(
-                &query_stdout_envelope(&env, options.budget_tokens, options.compact),
+                &query_stdout_envelope(&env, options.budget_tokens, options.compact)?,
                 options.pretty,
             )?;
             debug_assert_eq!(emitted, code);
             Ok(emitted)
         }
         Err(err) if err.to_string().contains("index_missing") => {
-            let mut env = Envelope::new("query", "index_missing");
-            env.root = Some(root.display().to_string());
+            let mut env = Envelope::for_root("query", "index_missing", &root);
             env.errors.push("index_missing; run scout index".into());
             finish_env(&env, options.pretty)
         }
@@ -1221,10 +1216,9 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
     let total_start = Instant::now();
     let snapshot = open_snapshot(root).map_err(|_| anyhow!("index_missing"))?;
     let cards = load_cards(&snapshot)?;
-    let stale = conservative_staleness_report(root, &snapshot.manifest, &cards);
+    let stale = staleness_report(root, &snapshot.manifest, &cards)?;
     if stale.stale {
-        let mut env = Envelope::new("query", "index_stale");
-        env.root = Some(root.display().to_string());
+        let mut env = Envelope::for_root("query", "index_stale", root);
         env.data = json!({
             "hint": "run scout index --refresh",
             "reason": stale.reason,
@@ -1232,7 +1226,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
         });
         return Ok(with_exit_code(env));
     }
-    let files = read_card_files(root, &cards);
+    let files = read_card_files(root, &cards)?;
     let deterministic = deterministic_candidates(query, &cards, &files, DEFAULT_CANDIDATES);
     let router_estimate = estimate_tokens(&thin_cards_json(query, &cards)) as f64 / 1_000_000.0
         * INPUT_DOLLARS_PER_MTOK
@@ -1242,8 +1236,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
         router_estimate
     );
     if max_dollars.is_some_and(|cap| router_estimate > cap) {
-        let mut env = Envelope::new("query", "budget_hit");
-        env.root = Some(root.display().to_string());
+        let mut env = Envelope::for_root("query", "budget_hit", root);
         env.data = json!({"estimated_usd": router_estimate, "max_dollars": max_dollars});
         return Ok(with_exit_code(env));
     }
@@ -1252,7 +1245,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
     let gate = BudgetGate::new(max_dollars);
     let router = match route_with_model(&client, &gate, query, &cards) {
         Ok(router) => router,
-        Err(err) if err.downcast_ref::<BudgetHitError>().is_some() => return Err(err),
+        Err(err) if is_scout_error(&err, ScoutErrorKind::BudgetHit) => return Err(err),
         Err(err) => {
             eprintln!("router degraded to deterministic union: {err:#}");
             Vec::new()
@@ -1261,8 +1254,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
     let candidates = final_candidates(router, deterministic, &cards);
     let candidate_paths: Vec<String> = candidates.iter().map(|c| c.path.clone()).collect();
     if candidates.is_empty() {
-        let mut env = Envelope::new("query", "unanswered");
-        env.root = Some(root.display().to_string());
+        let mut env = Envelope::for_root("query", "unanswered", root);
         env.spend = spend.lock().unwrap().clone();
         env.timings_ms
             .insert("total".into(), total_start.elapsed().as_millis());
@@ -1321,8 +1313,7 @@ fn query_once(query: &str, root: &Path, max_dollars: Option<f64>) -> Result<(Env
     let weak_signal = is_weak_signal(&findings, top_candidate_deterministic_score(&candidates));
     let budget_hit = gate.hit();
     let state = query_state(budget_hit.is_some(), chunks.len(), findings.len(), &dropped);
-    let mut env = Envelope::new("query", state);
-    env.root = Some(root.display().to_string());
+    let mut env = Envelope::for_root("query", state, root);
     env.spend = spend.lock().unwrap().clone();
     env.skipped = snapshot.manifest.skipped.clone();
     env.timings_ms
@@ -1403,7 +1394,7 @@ fn extract_chunk(
             Some(gate),
         )
         .map_err(|err| {
-            let reason = if err.downcast_ref::<BudgetHitError>().is_some() {
+            let reason = if is_scout_error(&err, ScoutErrorKind::BudgetHit) {
                 "budget_hit_before_retry".into()
             } else {
                 format!("provider_error: {err:#}")
@@ -1477,15 +1468,14 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
     let snapshot = match open_snapshot(&root) {
         Ok(s) => s,
         Err(_) => {
-            let mut env = Envelope::new("brief", "index_missing");
-            env.root = Some(root.display().to_string());
+            let mut env = Envelope::for_root("brief", "index_missing", &root);
             env.data = json!({"hint": "run scout index"});
             return finish_env(&env, options.pretty);
         }
     };
     let mut cards = load_cards(&snapshot)?;
     cards.sort_by(|a, b| a.path.cmp(&b.path));
-    let stale = conservative_staleness_report(&root, &snapshot.manifest, &cards);
+    let stale = staleness_report(&root, &snapshot.manifest, &cards)?;
     let mut dirs: BTreeMap<String, Vec<BriefModuleEntry<'_>>> = BTreeMap::new();
     for c in &cards {
         let dir = Path::new(&c.path)
@@ -1532,8 +1522,7 @@ fn cmd_brief(args: &[String]) -> Result<i32> {
     } else {
         data
     };
-    let mut env = Envelope::new("brief", "ok");
-    env.root = Some(root.display().to_string());
+    let mut env = Envelope::for_root("brief", "ok", &root);
     env.skipped = snapshot.manifest.skipped.clone();
     env.data = packed;
     merge_refresh_result(&mut env, refresh_result.as_ref());
@@ -1705,20 +1694,8 @@ fn cmd_eval(args: &[String]) -> Result<i32> {
         )?;
         persist_query_artifacts(Path::new(&q.corpus_root), &mut env)?;
         total_spend.merge(&env.spend);
-        let findings: Vec<Finding> = serde_json::from_value(
-            env.data
-                .get("findings")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-        )
-        .unwrap_or_default();
-        let candidate_files: Vec<String> = serde_json::from_value(
-            env.data
-                .get("candidate_files")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-        )
-        .unwrap_or_default();
+        let findings: Vec<Finding> = data_vec(&env.data, "findings")?;
+        let candidate_files: Vec<String> = data_vec(&env.data, "candidate_files")?;
         let must_files = q
             .must_find
             .iter()
@@ -1947,12 +1924,12 @@ fn load_eval_suite(path: &Path) -> Result<EvalSuite> {
 }
 
 fn write_eval_artifact(dir: &Path, query: &EvalQuery, env: &Envelope) -> Result<String> {
-    let last_run = env
+    let last_run_path = env
         .data
         .get("last_run_path")
         .and_then(Value::as_str)
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<Envelope>(&text).ok());
+        .context("query envelope missing data.last_run_path")?;
+    let last_run: Envelope = serde_json::from_str(&fs::read_to_string(last_run_path)?)?;
     let path = dir.join(format!("{}.json", query.id));
     fs::write(
         &path,
@@ -2074,34 +2051,15 @@ fn pct(n: usize, d: usize) -> f64 {
     }
 }
 
-fn walk_corpus(
-    root: &Path,
-    allow_sensitive: bool,
-    markdown_only: bool,
-) -> Result<(Vec<WalkedFile>, Vec<Skip>)> {
+fn walk_corpus(root: &Path, markdown_only: bool) -> Result<(Vec<WalkedFile>, Vec<Skip>)> {
     let mut files = Vec::new();
-    let mut skipped = if allow_sensitive {
-        Vec::new()
-    } else {
-        scan_sensitive_paths(root)?
-    };
+    let mut skipped = scan_sensitive_paths(root)?;
     let mut reported_sensitive: HashSet<String> = skipped.iter().map(|s| s.path.clone()).collect();
-    let mut builder = corpus_walk_builder(root);
-    builder.filter_entry(move |entry| {
-        let path = entry.path();
-        !entry
-            .file_type()
-            .is_some_and(|t| t.is_dir() && path_is_pruned(path))
-    });
-    for entry in builder.build() {
+    for entry in corpus_walk_builder(root).build() {
         let entry = match entry {
             Ok(e) => e,
             Err(_err) => {
-                skipped.push(Skip {
-                    path: String::new(),
-                    reason: "walk_error".into(),
-                    adapter: None,
-                });
+                skipped.push(Skip::new("", "walk_error", None));
                 continue;
             }
         };
@@ -2111,29 +2069,17 @@ fn walk_corpus(
         let rel = rel_path(root, entry.path());
         let adapter = adapter_for(entry.path());
         if markdown_only && adapter != "markdown" {
-            skipped.push(Skip {
-                path: rel,
-                reason: "unsupported_markdown_gate".into(),
-                adapter: Some(adapter),
-            });
+            skipped.push(Skip::new(rel, "unsupported_markdown_gate", Some(adapter)));
             continue;
         }
-        if !allow_sensitive && is_sensitive_path(Path::new(&rel), false) {
+        if is_sensitive_path(Path::new(&rel), false) {
             if reported_sensitive.insert(rel.clone()) {
-                skipped.push(Skip {
-                    path: rel,
-                    reason: "sensitive".into(),
-                    adapter: Some(adapter),
-                });
+                skipped.push(Skip::new(rel, "sensitive", Some(adapter)));
             }
             continue;
         }
         if is_binary_or_unsupported(entry.path()) && !matches!(adapter.as_str(), "pdf" | "docx") {
-            skipped.push(Skip {
-                path: rel,
-                reason: "binary_or_unsupported".into(),
-                adapter: Some(adapter),
-            });
+            skipped.push(Skip::new(rel, "binary_or_unsupported", Some(adapter)));
             continue;
         }
         let meta = match entry.metadata() {
@@ -2141,31 +2087,19 @@ fn walk_corpus(
             Err(_) => continue,
         };
         if meta.len() > MAX_FILE_BYTES && !matches!(adapter.as_str(), "pdf" | "docx") {
-            skipped.push(Skip {
-                path: rel,
-                reason: "too_large".into(),
-                adapter: Some(adapter),
-            });
+            skipped.push(Skip::new(rel, "too_large", Some(adapter)));
             continue;
         }
         let text = match read_adapter_text(entry.path(), &adapter) {
             Ok(t) => t,
             Err(_) if matches!(adapter.as_str(), "pdf" | "docx") => String::new(),
             Err(_) => {
-                skipped.push(Skip {
-                    path: rel,
-                    reason: "decode_error".into(),
-                    adapter: Some(adapter),
-                });
+                skipped.push(Skip::new(rel, "decode_error", Some(adapter)));
                 continue;
             }
         };
         if text.contains('\0') {
-            skipped.push(Skip {
-                path: rel,
-                reason: "binary_nul".into(),
-                adapter: Some(adapter),
-            });
+            skipped.push(Skip::new(rel, "binary_nul", Some(adapter)));
             continue;
         }
         let hash = sha256(text.as_bytes());
@@ -2191,6 +2125,11 @@ fn corpus_walk_builder(root: &Path) -> WalkBuilder {
         .git_exclude(true)
         .git_global(true)
         .add_custom_ignore_filename(".scoutignore");
+    builder.filter_entry(|entry| {
+        !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir() && path_is_pruned(entry.path()))
+    });
     builder
 }
 
@@ -2204,11 +2143,7 @@ fn harness_dir_skips(root: &Path) -> Vec<Skip> {
     HARNESS_DIRS
         .iter()
         .filter(|name| root.join(name).is_dir())
-        .map(|name| Skip {
-            path: (*name).into(),
-            reason: "harness_meta".into(),
-            adapter: None,
-        })
+        .map(|name| Skip::new(*name, "harness_meta", None))
         .collect()
 }
 
@@ -2220,11 +2155,7 @@ fn scan_sensitive_paths(root: &Path) -> Result<Vec<Skip>> {
             let rel = rel_path(root, &path);
             let file_type = entry.file_type()?;
             if is_sensitive_path(Path::new(&rel), file_type.is_dir()) {
-                out.push(Skip {
-                    path: rel,
-                    reason: "sensitive".into(),
-                    adapter: Some(adapter_for(&path)),
-                });
+                out.push(Skip::new(rel, "sensitive", Some(adapter_for(&path))));
                 if file_type.is_dir() {
                     continue;
                 }
@@ -2776,14 +2707,12 @@ fn load_cards(snapshot: &Snapshot) -> Result<Vec<Card>> {
         .collect()
 }
 
-fn read_card_files(root: &Path, cards: &[Card]) -> HashMap<String, String> {
+fn read_card_files(root: &Path, cards: &[Card]) -> Result<HashMap<String, String>> {
     cards
         .iter()
-        .filter_map(|c| {
+        .map(|c| {
             let path = root.join(&c.path);
-            read_adapter_text(&path, &c.adapter)
-                .ok()
-                .map(|text| (c.path.clone(), text))
+            Ok((c.path.clone(), read_adapter_text(&path, &c.adapter)?))
         })
         .collect()
 }
@@ -2816,14 +2745,7 @@ fn walk_corpus_file_meta(
     markdown_only: bool,
 ) -> Result<BTreeMap<String, ManifestFileMeta>> {
     let mut out = BTreeMap::new();
-    let mut builder = corpus_walk_builder(root);
-    builder.filter_entry(|entry| {
-        let path = entry.path();
-        !entry
-            .file_type()
-            .is_some_and(|t| t.is_dir() && path_is_pruned(path))
-    });
-    for entry in builder.build() {
+    for entry in corpus_walk_builder(root).build() {
         let entry = entry?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -2859,18 +2781,6 @@ struct StalenessReport {
     stale: bool,
     reason: String,
     changed_files: usize,
-}
-
-fn conservative_staleness_report(
-    root: &Path,
-    manifest: &Manifest,
-    cards: &[Card],
-) -> StalenessReport {
-    staleness_report(root, manifest, cards).unwrap_or_else(|_| StalenessReport {
-        stale: true,
-        reason: "content_hash_mismatch".into(),
-        changed_files: 0,
-    })
 }
 
 fn staleness_report(root: &Path, manifest: &Manifest, cards: &[Card]) -> Result<StalenessReport> {
@@ -2911,7 +2821,7 @@ fn changed_files_since_cards(root: &Path, manifest: &Manifest, cards: &[Card]) -
         if manifest.file_meta.get(&path) == Some(current) {
             continue;
         }
-        let text = read_adapter_text(&root.join(&path), &card.adapter).unwrap_or_default();
+        let text = read_adapter_text(&root.join(&path), &card.adapter)?;
         if sha256(text.as_bytes()) != card.hash {
             changed += 1;
         }
@@ -3480,15 +3390,20 @@ fn persist_query_artifacts(root: &Path, env: &mut Envelope) -> Result<()> {
     Ok(())
 }
 
-fn query_stdout_envelope(env: &Envelope, budget_tokens: Option<usize>, compact: bool) -> Envelope {
+fn data_vec<T: for<'de> Deserialize<'de>>(data: &Value, key: &str) -> Result<Vec<T>> {
+    let value = data
+        .get(key)
+        .with_context(|| format!("query envelope missing data.{key}"))?;
+    Ok(serde_json::from_value(value.clone())?)
+}
+
+fn query_stdout_envelope(
+    env: &Envelope,
+    budget_tokens: Option<usize>,
+    compact: bool,
+) -> Result<Envelope> {
     let mut out = env.clone();
-    let findings = serde_json::from_value::<Vec<Finding>>(
-        out.data
-            .get("findings")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-    )
-    .unwrap_or_default();
+    let findings = data_vec(&out.data, "findings")?;
     let visible_findings = pack_findings(findings, budget_tokens);
     out.data["findings"] = if compact {
         json!(compact_findings(&visible_findings))
@@ -3496,16 +3411,10 @@ fn query_stdout_envelope(env: &Envelope, budget_tokens: Option<usize>, compact: 
         json!(visible_findings)
     };
     if compact {
-        let dropped = serde_json::from_value::<Vec<DroppedFinding>>(
-            out.data
-                .get("dropped")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-        )
-        .unwrap_or_default();
+        let dropped = data_vec(&out.data, "dropped")?;
         out.data["dropped"] = json!(dropped_reason_counts(&dropped));
     }
-    out
+    Ok(out)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -3531,7 +3440,7 @@ fn prune_query_runs(runs: &Path, keep: usize) -> Result<()> {
     }
     files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     for path in files.into_iter().skip(keep) {
-        let _ = fs::remove_file(path);
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -3784,7 +3693,7 @@ struct IndexEstimate {
 }
 
 fn incremental_index_estimate(root: &Path, markdown_only: bool) -> Result<IndexEstimate> {
-    let (files, _) = walk_corpus(root, false, markdown_only)?;
+    let (files, _) = walk_corpus(root, markdown_only)?;
     let model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     let old_by_key = reusable_cards_by_key(root, &model);
     let to_card = files_to_card(&files, &old_by_key);
@@ -3818,15 +3727,6 @@ fn files_to_card<'a>(
 
 fn estimate_index_cost_refs(files: &[&WalkedFile]) -> f64 {
     let toks: usize = files.iter().map(|f| estimate_tokens(&f.text) + 700).sum();
-    toks as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK + files.len() as f64 * 0.001
-}
-
-fn estimate_index_cost(files: &[WalkedFile]) -> f64 {
-    let toks: usize = files
-        .iter()
-        .filter(|f| !matches!(f.adapter.as_str(), "pdf" | "docx") || !f.text.is_empty())
-        .map(|f| estimate_tokens(&f.text) + 700)
-        .sum();
     toks as f64 / 1_000_000.0 * INPUT_DOLLARS_PER_MTOK + files.len() as f64 * 0.001
 }
 
@@ -4003,7 +3903,7 @@ mod tests {
     #[test]
     fn query_parser_rejects_unknown_dash_flags_after_query() {
         let err = cmd_query(&["hello".into(), "--budgett".into()]).unwrap_err();
-        assert!(err.downcast_ref::<UsageError>().is_some());
+        assert!(is_scout_error(&err, ScoutErrorKind::Usage));
         assert!(err.to_string().contains("unknown query flag --budgett"));
     }
 
@@ -4041,16 +3941,16 @@ mod tests {
     fn index_subprocess_failures_keep_envelope_error_types() {
         let mut env = Envelope::new("index", "provider_error");
         let err = index_subprocess_error(Some(13), &env, br#"{"state":"provider_error"}"#).unwrap();
-        assert!(err.downcast_ref::<ProviderError>().is_some());
+        assert!(is_scout_error(&err, ScoutErrorKind::Provider));
 
         env.state = "budget_hit".into();
         let err = index_subprocess_error(Some(10), &env, br#"{"state":"budget_hit"}"#).unwrap();
-        assert!(err.downcast_ref::<BudgetHitError>().is_some());
+        assert!(is_scout_error(&err, ScoutErrorKind::BudgetHit));
 
         env.state = "partial".into();
         let err = index_subprocess_error(Some(3), &env, br#"{"state":"partial"}"#).unwrap();
-        assert!(err.downcast_ref::<ProviderError>().is_none());
-        assert!(err.downcast_ref::<BudgetHitError>().is_none());
+        assert!(!is_scout_error(&err, ScoutErrorKind::Provider));
+        assert!(!is_scout_error(&err, ScoutErrorKind::BudgetHit));
     }
 
     #[test]
@@ -4171,7 +4071,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.md"), "# A\nsame\n").unwrap();
         fs::write(dir.path().join("b.md"), "# B\nold\n").unwrap();
-        let (files, _) = walk_corpus(dir.path(), false, false).unwrap();
+        let (files, _) = walk_corpus(dir.path(), false).unwrap();
         let cards = files.iter().map(|f| skeletonize(f, 0)).collect::<Vec<_>>();
         let manifest = test_manifest_with_files(dir.path(), cards.len(), &files);
         write_generation(dir.path(), &manifest, &cards).unwrap();
@@ -4195,7 +4095,7 @@ mod tests {
     fn manifest_mismatch_staleness_skips_content_change_count() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.md"), "# A\nsame\n").unwrap();
-        let (files, _) = walk_corpus(dir.path(), false, false).unwrap();
+        let (files, _) = walk_corpus(dir.path(), false).unwrap();
         let cards = files.iter().map(|f| skeletonize(f, 0)).collect::<Vec<_>>();
         let mut manifest = test_manifest_with_files(dir.path(), cards.len(), &files);
         manifest.adapter_version = "old".into();
@@ -4344,16 +4244,7 @@ mod tests {
     #[test]
     fn firewall_accepts_whitespace_normalized_quote_near_cited_line() {
         let files = HashMap::from([("a.md".to_string(), "one\nalpha   beta\ngamma\n".to_string())]);
-        let finding = Finding {
-            file: "a.md".into(),
-            line: 2,
-            fact: "The file says alpha beta.".into(),
-            quote: Some("alpha beta".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        };
+        let finding = test_finding("a.md", 2, "The file says alpha beta.", "alpha beta");
         let (kept, dropped) = verify_quotes(vec![finding], &files);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].match_tier.as_deref(), Some("exact"));
@@ -4366,16 +4257,12 @@ mod tests {
             "a.md".to_string(),
             "one\nThe **bold** and `code` _em_ ~~strike~~ terms matter.\n".to_string(),
         )]);
-        let finding = Finding {
-            file: "a.md".into(),
-            line: 2,
-            fact: "The markdown line names bold and code.".into(),
-            quote: Some("The bold and code em strike terms matter.".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        };
+        let finding = test_finding(
+            "a.md",
+            2,
+            "The markdown line names bold and code.",
+            "The bold and code em strike terms matter.",
+        );
         let (kept, dropped) = verify_quotes(vec![finding], &files);
         assert!(dropped.is_empty());
         assert_eq!(kept.len(), 1);
@@ -4389,30 +4276,22 @@ mod tests {
             "fn main() { let my_var = 1; }\n".to_string(),
         )]);
         let md = HashMap::from([("notes.md".to_string(), "The value is my_var.\n".to_string())]);
-        let finding = Finding {
-            file: "lib.rs".into(),
-            line: 1,
-            fact: "The code names my_var.".into(),
-            quote: Some("fn main() { let myvar = 1; }".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        };
+        let finding = test_finding(
+            "lib.rs",
+            1,
+            "The code names my_var.",
+            "fn main() { let myvar = 1; }",
+        );
         let (kept, dropped) = verify_quotes(vec![finding], &code);
         assert!(kept.is_empty());
         assert_eq!(dropped[0].reason, "quote_not_in_file");
 
-        let finding = Finding {
-            file: "notes.md".into(),
-            line: 1,
-            fact: "The prose names my_var.".into(),
-            quote: Some("The value is myvar.".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        };
+        let finding = test_finding(
+            "notes.md",
+            1,
+            "The prose names my_var.",
+            "The value is myvar.",
+        );
         let (kept, dropped) = verify_quotes(vec![finding], &md);
         assert!(dropped.is_empty());
         assert_eq!(kept[0].match_tier.as_deref(), Some("markdown_normalized"));
@@ -4424,16 +4303,7 @@ mod tests {
             "a.md".to_string(),
             "The **bold** thing exists.\n".to_string(),
         )]);
-        let finding = Finding {
-            file: "a.md".into(),
-            line: 1,
-            fact: "absent".into(),
-            quote: Some("The bold absent thing exists.".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        };
+        let finding = test_finding("a.md", 1, "absent", "The bold absent thing exists.");
         let (_, dropped) = verify_quotes(vec![finding], &files);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].reason, "quote_not_in_file");
@@ -4443,26 +4313,8 @@ mod tests {
     fn firewall_drops_absent_quote_or_bad_line() {
         let files = HashMap::from([("a.md".to_string(), "one\ntwo\nneedle\n".to_string())]);
         let bad = vec![
-            Finding {
-                file: "a.md".into(),
-                line: 3,
-                fact: "bad".into(),
-                quote: Some("missing".into()),
-                quote_omitted: false,
-                router_rank: None,
-                deterministic_score: 0.0,
-                match_tier: None,
-            },
-            Finding {
-                file: "a.md".into(),
-                line: 30,
-                fact: "bad".into(),
-                quote: Some("needle".into()),
-                quote_omitted: false,
-                router_rank: None,
-                deterministic_score: 0.0,
-                match_tier: None,
-            },
+            test_finding("a.md", 3, "bad", "missing"),
+            test_finding("a.md", 30, "bad", "needle"),
         ];
         let (_, dropped) = verify_quotes(bad, &files);
         assert_eq!(dropped.len(), 2);
@@ -4476,16 +4328,12 @@ mod tests {
 
     #[test]
     fn exact_claim_query_drops_partial_phrase_hits() {
-        let finding = Finding {
-            file: "changelog.md".into(),
-            line: 7,
-            fact: "The changelog says the old compact was a blank check.".into(),
-            quote: Some("PACT Compact: blank check".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        };
+        let finding = test_finding(
+            "changelog.md",
+            7,
+            "The changelog says the old compact was a blank check.",
+            "PACT Compact: blank check",
+        );
         assert!(!matches_exact_claim_query(
             "Where does the corpus say PACT creates a blank-check foreign-aid grant program?",
             &finding
@@ -4494,16 +4342,12 @@ mod tests {
 
     #[test]
     fn exact_claim_query_does_not_trust_inflated_fact() {
-        let finding = Finding {
-            file: "changelog.md".into(),
-            line: 7,
-            fact: "PACT creates a blank-check foreign-aid grant program.".into(),
-            quote: Some("PACT Compact: blank check".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        };
+        let finding = test_finding(
+            "changelog.md",
+            7,
+            "PACT creates a blank-check foreign-aid grant program.",
+            "PACT Compact: blank check",
+        );
         assert!(!matches_exact_claim_query(
             "Where does the corpus say PACT creates a blank-check foreign-aid grant program?",
             &finding
@@ -4512,16 +4356,12 @@ mod tests {
 
     #[test]
     fn exact_claim_query_keeps_full_claim_hits() {
-        let finding = Finding {
-            file: "brief.md".into(),
-            line: 9,
-            fact: "PACT creates a blank-check foreign-aid grant program.".into(),
-            quote: Some("PACT creates a blank-check foreign-aid grant program".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        };
+        let finding = test_finding(
+            "brief.md",
+            9,
+            "PACT creates a blank-check foreign-aid grant program.",
+            "PACT creates a blank-check foreign-aid grant program",
+        );
         assert!(matches_exact_claim_query(
             "Where does the corpus say PACT creates a blank-check foreign-aid grant program?",
             &finding
@@ -4632,8 +4472,7 @@ mod tests {
     fn query_artifacts_are_full_atomic_envelopes_and_keep_newest_twenty() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..22 {
-            let mut env = Envelope::new("query", "ok");
-            env.root = Some(dir.path().display().to_string());
+            let mut env = Envelope::for_root("query", "ok", dir.path());
             env.spend.usd = i as f64;
             env.timings_ms.insert("total".into(), i);
             env.data = json!({"query": format!("q{i}"), "generation": "gen-test", "findings": [], "dropped": []});
@@ -4700,7 +4539,7 @@ mod tests {
             "refreshed_index": {"generation": "gen-refresh", "estimated_usd": 0.01},
         });
         persist_query_artifacts(dir.path(), &mut env).unwrap();
-        let stdout_env = query_stdout_envelope(&env, None, true);
+        let stdout_env = query_stdout_envelope(&env, None, true).unwrap();
         assert!(
             stdout_env.data["findings"][0]
                 .get("deterministic_score")
@@ -4736,15 +4575,18 @@ mod tests {
     }
 
     #[test]
+    fn query_stdout_rejects_invalid_internal_data() {
+        let mut env = Envelope::new("query", "ok");
+        env.data = json!({"findings": "not an array", "dropped": []});
+
+        assert!(query_stdout_envelope(&env, None, true).is_err());
+    }
+
+    #[test]
     fn ranked_chunks_respects_cap_even_with_many_files() {
         let chunks = (0..10)
             .map(|i| Chunk {
-                candidate: Candidate {
-                    path: format!("f{i}.rs"),
-                    router_rank: Some(i + 1),
-                    deterministic_score: i as f64,
-                    look_for: None,
-                },
+                candidate: cand(&format!("f{i}.rs"), Some(i + 1), i as f64),
                 first_line: 1,
                 body: format!("query term {i}"),
             })
@@ -4755,16 +4597,12 @@ mod tests {
 
     #[test]
     fn poison_matcher_requires_named_subject_not_neighbor_fact() {
-        let findings = vec![Finding {
-            file: "brief.md".into(),
-            line: 5,
-            fact: "Current DFC insurance covers only invested capital.".into(),
-            quote: Some("Current DFC insurance covers only invested capital".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        }];
+        let findings = vec![test_finding(
+            "brief.md",
+            5,
+            "Current DFC insurance covers only invested capital.",
+            "Current DFC insurance covers only invested capital",
+        )];
         assert!(!poison_survives(
             "The Shield only covers invested capital",
             "What are the six PACT Act instruments?",
@@ -4774,17 +4612,12 @@ mod tests {
 
     #[test]
     fn poison_matcher_requires_exclusivity_term_for_exclusivity_poison() {
-        let findings = vec![Finding {
-            file: "brief.md".into(),
-            line: 8,
-            fact: "The Shield covers full economic value at risk, including invested capital."
-                .into(),
-            quote: Some("full economic value at risk, including invested capital".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        }];
+        let findings = vec![test_finding(
+            "brief.md",
+            8,
+            "The Shield covers full economic value at risk, including invested capital.",
+            "full economic value at risk, including invested capital",
+        )];
         assert!(!poison_survives(
             "The Shield only covers invested capital",
             "What are the six PACT Act instruments?",
@@ -4794,16 +4627,12 @@ mod tests {
 
     #[test]
     fn poison_matcher_catches_actual_exclusivity_poison() {
-        let findings = vec![Finding {
-            file: "brief.md".into(),
-            line: 8,
-            fact: "The Shield only covers invested capital.".into(),
-            quote: Some("The Shield only covers invested capital".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        }];
+        let findings = vec![test_finding(
+            "brief.md",
+            8,
+            "The Shield only covers invested capital.",
+            "The Shield only covers invested capital",
+        )];
         assert!(poison_survives(
             "The Shield only covers invested capital",
             "What are the six PACT Act instruments?",
@@ -4813,16 +4642,12 @@ mod tests {
 
     #[test]
     fn poison_matcher_treats_rather_than_as_counterclaim() {
-        let findings = vec![Finding {
-            file: "brief.md".into(),
-            line: 35,
-            fact: "The PACT Act provides American Investment Shield coverage through the DFC, which covers enterprise value rather than just invested capital.".into(),
-            quote: Some("covers enterprise value, not just invested capital".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        }];
+        let findings = vec![test_finding(
+            "brief.md",
+            35,
+            "The PACT Act provides American Investment Shield coverage through the DFC, which covers enterprise value rather than just invested capital.",
+            "covers enterprise value, not just invested capital",
+        )];
         assert!(!poison_survives(
             "The Shield only covers invested capital",
             "What six instruments does the PACT Act build, and what does each do?",
@@ -4832,16 +4657,12 @@ mod tests {
 
     #[test]
     fn poison_matcher_ignores_query_overlap_without_distinctive_terms() {
-        let findings = vec![Finding {
-            file: "brief.md".into(),
-            line: 9,
-            fact: "The PACT Act creates six interlocking instruments.".into(),
-            quote: Some("The PACT Act creates six interlocking instruments".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        }];
+        let findings = vec![test_finding(
+            "brief.md",
+            9,
+            "The PACT Act creates six interlocking instruments.",
+            "The PACT Act creates six interlocking instruments",
+        )];
         assert!(!poison_survives(
             "The PACT Act creates a blank-check foreign aid grant program",
             "What are the six PACT Act instruments?",
@@ -4851,16 +4672,12 @@ mod tests {
 
     #[test]
     fn poison_matcher_catches_actual_distinctive_poison() {
-        let findings = vec![Finding {
-            file: "brief.md".into(),
-            line: 9,
-            fact: "The PACT Act creates a blank-check foreign aid grant program.".into(),
-            quote: Some("blank-check foreign aid grant program".into()),
-            quote_omitted: false,
-            router_rank: None,
-            deterministic_score: 0.0,
-            match_tier: None,
-        }];
+        let findings = vec![test_finding(
+            "brief.md",
+            9,
+            "The PACT Act creates a blank-check foreign aid grant program.",
+            "blank-check foreign aid grant program",
+        )];
         assert!(poison_survives(
             "The PACT Act creates a blank-check foreign aid grant program",
             "What are the six PACT Act instruments?",
@@ -4888,7 +4705,7 @@ mod tests {
         fs::write(dir.path().join("id_ed25519"), "PRIVATE KEY").unwrap();
         fs::write(dir.path().join("bundle.pfx"), "CERT").unwrap();
         fs::write(dir.path().join("README.md"), "# safe").unwrap();
-        let (files, skipped) = walk_corpus(dir.path(), false, false).unwrap();
+        let (files, skipped) = walk_corpus(dir.path(), false).unwrap();
         assert!(files.iter().any(|f| f.rel == "README.md"));
         for path in [
             ".env",
@@ -4928,7 +4745,7 @@ mod tests {
         fs::create_dir_all(dir.path().join(".tldr")).unwrap();
         fs::write(dir.path().join(".tldr/cache.json"), "noise").unwrap();
         fs::write(dir.path().join("README.md"), "# safe").unwrap();
-        let (files, skipped) = walk_corpus(dir.path(), false, false).unwrap();
+        let (files, skipped) = walk_corpus(dir.path(), false).unwrap();
         assert_eq!(
             files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(),
             vec!["README.md"]
@@ -4981,13 +4798,9 @@ mod tests {
     fn generation_snapshot_survives_one_prune_then_ages_out() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let c1 = test_card_with_role("a.md", "old");
-        let m1 = test_manifest(root, 1);
-        let gen1 = write_generation(root, &m1, &[c1]).unwrap();
+        let gen1 = write_test_generation(root, "old");
         let snap = open_snapshot(root).unwrap();
-        let c2 = test_card_with_role("a.md", "new");
-        let m2 = test_manifest(root, 1);
-        let gen2 = write_generation(root, &m2, &[c2]).unwrap();
+        let gen2 = write_test_generation(root, "new");
         prune_generations(root, 2).unwrap();
         assert_ne!(gen1, gen2);
         assert!(gen1.exists());
@@ -4998,9 +4811,7 @@ mod tests {
                 .value,
             "new"
         );
-        let c3 = test_card_with_role("a.md", "newer");
-        let m3 = test_manifest(root, 1);
-        let gen3 = write_generation(root, &m3, &[c3]).unwrap();
+        let gen3 = write_test_generation(root, "newer");
         fs::write(
             root.join(".scout/current"),
             gen1.file_name().unwrap().to_string_lossy().as_bytes(),
@@ -5078,24 +4889,14 @@ mod tests {
     #[test]
     fn one_rebuild_keeps_concurrent_snapshot_reads_consistent() {
         let dir = tempfile::tempdir().unwrap();
-        write_generation(
-            dir.path(),
-            &test_manifest(dir.path(), 1),
-            &[test_card_with_role("a.md", "old")],
-        )
-        .unwrap();
+        write_test_generation(dir.path(), "old");
         let root = Arc::new(dir.path().to_path_buf());
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let writer_root = root.clone();
         let writer_barrier = barrier.clone();
         let writer = std::thread::spawn(move || {
             writer_barrier.wait();
-            write_generation(
-                &writer_root,
-                &test_manifest(&writer_root, 1),
-                &[test_card_with_role("a.md", "new")],
-            )
-            .unwrap();
+            write_test_generation(&writer_root, "new");
             prune_generations(&writer_root, 2).unwrap();
         });
         barrier.wait();
@@ -5113,7 +4914,7 @@ mod tests {
         let corpus = dir.path().join("corpus");
         fs::create_dir(&corpus).unwrap();
         fs::write(corpus.join("a.md"), "# A\n").unwrap();
-        let (files, _) = walk_corpus(&corpus, false, false).unwrap();
+        let (files, _) = walk_corpus(&corpus, false).unwrap();
         let cards = files.iter().map(|f| skeletonize(f, 0)).collect::<Vec<_>>();
         let mut manifest = test_manifest_with_files(&corpus, cards.len(), &files);
         manifest.model = env::var("SCOUT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
@@ -5193,7 +4994,7 @@ mod tests {
         fs::write(corpus.path().join("c.md"), "# Markdown\ngamma\n").unwrap();
         let _path = ScopedPath::set(tools.path());
 
-        let (files, skipped) = walk_corpus(corpus.path(), false, false).unwrap();
+        let (files, skipped) = walk_corpus(corpus.path(), false).unwrap();
         assert!(skipped.is_empty());
         assert_eq!(files.len(), 3);
         let pdf = files.iter().find(|f| f.rel == "a.pdf").unwrap();
@@ -5222,9 +5023,9 @@ mod tests {
     fn quote_firewall_handles_five_line_boundary_and_multiline_quotes() {
         let text = "one\ntwo\nthree\nfour\nfive\nalpha beta\nseven\n";
         let files = HashMap::from([("a.md".to_string(), text.to_string())]);
-        let at_boundary = finding_at("a.md", 1, "alpha beta");
-        let outside_boundary = finding_at("a.md", 12, "alpha beta");
-        let multiline = finding_at("a.md", 6, "alpha\nbeta");
+        let at_boundary = test_finding("a.md", 1, "supported fact", "alpha beta");
+        let outside_boundary = test_finding("a.md", 12, "supported fact", "alpha beta");
+        let multiline = test_finding("a.md", 6, "supported fact", "alpha\nbeta");
         let (kept, dropped) = verify_quotes(vec![at_boundary, outside_boundary, multiline], &files);
         assert_eq!(kept.len(), 2);
         assert_eq!(dropped.len(), 1);
@@ -5250,11 +5051,11 @@ mod tests {
         }
     }
 
-    fn finding_at(path: &str, line: usize, quote: &str) -> Finding {
+    fn test_finding(path: &str, line: usize, fact: &str, quote: &str) -> Finding {
         Finding {
             file: path.into(),
             line,
-            fact: "supported fact".into(),
+            fact: fact.into(),
             quote: Some(quote.into()),
             quote_omitted: false,
             router_rank: None,
@@ -5318,6 +5119,15 @@ mod tests {
                 value: vec![],
             },
         }
+    }
+
+    fn write_test_generation(root: &Path, role: &str) -> PathBuf {
+        write_generation(
+            root,
+            &test_manifest(root, 1),
+            &[test_card_with_role("a.md", role)],
+        )
+        .unwrap()
     }
 
     fn test_manifest(root: &Path, cards: usize) -> Manifest {

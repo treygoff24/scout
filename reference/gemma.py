@@ -1,14 +1,64 @@
 """Minimal Cerebras chat client. stdlib only — requests isn't installed here."""
+from __future__ import annotations
+
 import json
 import os
 import threading
 import time
 import urllib.request
+from typing import Literal, NotRequired, TypedDict, Unpack, cast
+
+
+class ChatMessage(TypedDict):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class ChatOptions(TypedDict, total=False):
+    temperature: float
+    max_tokens: int
+
+
+class ChatRequest(ChatOptions):
+    model: str
+    messages: list[ChatMessage]
+    stream: bool
+
+
+class Usage(TypedDict, total=False):
+    prompt_tokens: int
+    completion_tokens: int
+
+
+class ResponseMessage(TypedDict, total=False):
+    content: str
+
+
+class Choice(TypedDict):
+    message: ResponseMessage
+
+
+class TimeInfo(TypedDict, total=False):
+    completion_time: float
+
+
+class ChatResponse(TypedDict):
+    choices: list[Choice]
+    usage: Usage
+    wall_s: float
+    time_info: NotRequired[TimeInfo]
+
+
+class Spend(TypedDict):
+    in_tok: int
+    out_tok: int
+    usd: float
+    calls: int
 
 API = "https://api.cerebras.ai/v1/chat/completions"
 UA = "volley/0.1 (github.com/treygoff; experiment harness)"  # default urllib UA gets Cloudflare-403'd
 
-def _key():
+def _key() -> str:
     # env first: ccp/ccw inject the active profile's key (personal vs work split)
     if os.environ.get("CEREBRAS_API_KEY"):
         return os.environ["CEREBRAS_API_KEY"].strip()
@@ -25,11 +75,16 @@ PRICE = {  # $/MTok (input, output)
 }
 
 _lock = threading.Lock()
-spend = {"in_tok": 0, "out_tok": 0, "usd": 0.0, "calls": 0}
+spend: Spend = {"in_tok": 0, "out_tok": 0, "usd": 0.0, "calls": 0}
 
-def chat(messages, model="gemma-4-31b", retries=6, **kw):
+def chat(
+    messages: list[ChatMessage],
+    model: str = "gemma-4-31b",
+    retries: int = 6,
+    **kw: Unpack[ChatOptions],
+) -> ChatResponse:
     """One chat completion. Returns full parsed response with wall_s added."""
-    body = {"model": model, "messages": messages, "stream": False, **kw}
+    body: ChatRequest = {"model": model, "messages": messages, "stream": False, **kw}
     req = urllib.request.Request(
         API,
         data=json.dumps(body).encode(),
@@ -43,9 +98,9 @@ def chat(messages, model="gemma-4-31b", retries=6, **kw):
         t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
-                out = json.load(r)
+                out = cast(ChatResponse, json.load(r))
             out["wall_s"] = time.time() - t0
-            u = out.get("usage", {})
+            u: Usage = out.get("usage", {})
             pi, po = PRICE.get(model, (2.15, 2.70))
             with _lock:
                 spend["in_tok"] += u.get("prompt_tokens", 0)
@@ -60,15 +115,18 @@ def chat(messages, model="gemma-4-31b", retries=6, **kw):
                 continue
             raise RuntimeError(f"HTTP {e.code}: {e.read().decode()[:500]}") from e
 
-def text(resp):
+def text(resp: ChatResponse) -> str | None:
     return resp["choices"][0]["message"].get("content")
 
-def report():
+def report() -> str:
     return f"{spend['calls']} calls, {spend['in_tok']} in / {spend['out_tok']} out tok, ${spend['usd']:.4f}"
 
 if __name__ == "__main__":
-    r = chat([{"role": "user", "content": "Say hi in exactly five words."}])
-    ti = r.get("time_info", {})
+    messages: list[ChatMessage] = [
+        {"role": "user", "content": "Say hi in exactly five words."}
+    ]
+    r = chat(messages)
+    ti: TimeInfo = r.get("time_info", {})
     ct, n = ti.get("completion_time", 0), r["usage"]["completion_tokens"]
     print(text(r))
     print(f"wall {r['wall_s']*1000:.0f}ms | server completion {ct*1000:.1f}ms | {n} tok -> {n/ct:.0f} tok/s | {report()}")
