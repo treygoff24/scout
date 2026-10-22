@@ -2,7 +2,7 @@
 
 Internal build/eval status record kept during development. Left as-is post-ship for provenance — read the entries below as a chronological log of what was measured during the build, not a live dashboard.
 
-Current phase: shipped. 0.1.0 published to crates.io (`scout-cli`) and the `treygoff24/homebrew-tap` Homebrew tap (`brew install treygoff24/tap/scout`), with tag `v0.1.0` pushed and released on GitHub. Post-review hardening campaign completed before ship (2026-07-06). M1 re-verified green post-refactor (recall 100, coverage 80.95, poison 0, $0.5839). M3 re-verified green with IMPROVED coverage 91.30 (was 82.61; markdown-normalized quote tier recovered false drops), negatives clean, $0.6747. Three reviewed waves: trust/state-machine (f3ba5aa), robustness (b2ba48f), agent-UX (d155630). 46 unit tests. See docs/dogfood/2026-07-06-journal.md for the driving findings and scorecard.
+Current phase: shipped. Latest release 0.1.1 (2026-10-22, dependency security bumps; see CHANGELOG.md). 0.1.0 (first release) published to crates.io (`scout-cli`) and the `treygoff24/homebrew-tap` Homebrew tap (`brew install treygoff24/tap/scout`), with tag `v0.1.0` pushed and released on GitHub. Post-review hardening campaign completed before ship (2026-07-06). M1 re-verified green post-refactor (recall 100, coverage 80.95, poison 0, $0.5839). M3 re-verified green with IMPROVED coverage 91.30 (was 82.61; markdown-normalized quote tier recovered false drops), negatives clean, $0.6747. Three reviewed waves: trust/state-machine (f3ba5aa), robustness (b2ba48f), agent-UX (d155630). 61 tests (as of 0.1.1). See docs/dogfood/2026-07-06-journal.md for the driving findings and scorecard.
 
 ## Gates / numbers
 

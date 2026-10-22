@@ -1,6 +1,6 @@
 [package]
 name = "scout-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Corpus hydration at retina speed — fast, cheap, hallucination-firewalled orientation for AI agents in any directory of code or documents."
 license = "Apache-2.0"
