@@ -4,6 +4,8 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
+# release.yml carries intentional hand edits (pinned action majors, pipefail, comments); dist would otherwise refuse to plan
+allow-dirty = ["ci"]
 installers = ["shell", "homebrew"]
 tap = "treygoff24/homebrew-tap"
 # Formula name so `brew install treygoff24/tap/scout` works despite the scout-cli package name
